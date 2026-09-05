@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lcsa"
+version = "0.1.0"
+description = "Identifiability audit of context-decay parameters fitted through language-model likelihoods"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "pandas>=2.0",
+  "pyyaml>=6.0",
+  "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+gpu = ["torch>=2.0", "transformers>=4.40"]
+rt = ["statsmodels>=0.14"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+lcsa = "lcsa.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+filterwarnings = ["ignore::DeprecationWarning"]

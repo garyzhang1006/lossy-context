@@ -1,0 +1,25 @@
+# Defaults for `lcsa --config config/default.yaml <command>`.
+# Only keys matching a command's own options are used; anything else is ignored,
+# so one file can carry the settings for every leg.
+
+provo_dir: data/provo
+subtlex: data/SUBTLEXusfrequencyabove1.csv
+model: Qwen/Qwen2.5-1.5B
+dtype: float16
+out: artifacts
+
+# Cache geometry.  max_depth 32 is the registered cap on how far back the
+# nested ablation goes; Provo's mean context is 21.86 words, so raising it buys
+# very little and costs a forward pass per extra depth.
+max_depth: 32
+max_candidates: 120
+top_k: 50
+
+# Replication counts.  200 is the registered number for both the null
+# replicates and the cluster bootstrap; drop them for a smoke run and say so.
+n_rep: 200
+n_boot: 200
+estimators:
+  - naive
+  - repaired
+seed: 0

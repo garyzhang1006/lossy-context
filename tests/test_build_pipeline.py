@@ -1,0 +1,178 @@
+"""Provo plus a reference model to a fitted corpus, with nothing mocked in between.
+
+This covers the one seam the synthetic tests cannot reach: the candidate set,
+the nested cache, the target key file, and the alignment of the eye-tracking arm
+to the built targets.  The reference model is a two-layer transformer with random
+weights, so the numbers are meaningless while every shape, index and join is real.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+from test_provo_loader import PASSAGES, _eye_rows, _norms_rows
+from test_tokenization import ByteTokenizer
+
+from lcsa.build import BuildConfig, build_corpus, gate_g0
+from lcsa.data.provo import canonical_word, load_provo
+from lcsa.data.subtlex import load_subtlex
+from lcsa.experiments.e4_reading import gaze_table, window_surprisal
+from lcsa.fitting import fit
+from lcsa.likelihood import NAIVE, loglik
+from lcsa.store import load_corpus, save_corpus
+from lcsa.tokenization import OOV
+
+torch = pytest.importorskip("torch")
+pytest.importorskip("transformers")
+
+
+@pytest.fixture(scope="module")
+def provo_dir(tmp_path_factory):
+    """Module-scoped copy of the loader fixture; the build below is too slow to repeat."""
+    d = tmp_path_factory.mktemp("provo")
+    norms = _norms_rows()
+    norms.loc[0, "Word"] = "Th\u00e9"
+    norms.to_csv(d / "Provo_Corpus-Predictability_Norms.csv", index=False,
+                 encoding="latin-1")
+    _eye_rows().to_csv(d / "Provo_Corpus-Eyetracking_Data.csv", index=False)
+    return d
+
+
+@pytest.fixture(scope="module")
+def scorer():
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    from lcsa.cache import ReferenceScorer
+
+    torch.manual_seed(3)
+    cfg = GPT2Config(vocab_size=256, n_positions=256, n_embd=32, n_layer=2, n_head=2)
+    return ReferenceScorer("test-tiny", device="cpu", dtype="float32",
+                           model=GPT2LMHeadModel(cfg), tokenizer=ByteTokenizer())
+
+
+@pytest.fixture(scope="module")
+def built(provo_dir, scorer):
+    provo = load_provo(provo_dir, require_eye=True)
+    cfg = BuildConfig(max_candidates=20, max_depth=4, top_k_expansions=0)
+    words, keys = [], []
+    corpus = build_corpus(provo, scorer, load_subtlex(None), cfg,
+                          keep_words=words, keep_keys=keys)
+    return provo, corpus, words, keys
+
+
+def test_every_non_initial_target_is_built(built):
+    """Word 1 of a passage has no context, so it carries no cache and no target."""
+    provo, corpus, _, keys = built
+    expected = sum(len(w) - 1 for w in PASSAGES.values())
+    assert len(corpus) == expected
+    assert all(wn > 1 for _, wn in keys)
+
+
+def test_keys_are_returned_in_corpus_order(built):
+    provo, corpus, words, keys = built
+    assert len(keys) == len(corpus) == len(words)
+    for (tid, _), tgt in zip(keys, corpus):
+        assert tgt.cluster == list(sorted({k[0] for k in keys})).index(tid)
+
+
+def test_depth_is_the_number_of_preceding_words_capped_at_the_config(built):
+    provo, corpus, _, keys = built
+    for (tid, wn), tgt in zip(keys, corpus):
+        assert tgt.K == min(wn - 1, 4)
+
+
+def test_cache_rows_are_distributions_and_differ_across_depth(built):
+    _, corpus, _, _ = built
+    for tgt in corpus:
+        assert np.allclose(tgt.P.sum(axis=1), 1.0, atol=1e-6)
+        if tgt.K > 0:
+            assert np.abs(tgt.P[-1] - tgt.P[0]).max() > 1e-9
+
+
+def test_gate_g0_passes_on_the_built_cache(built):
+    provo, corpus, _, _ = built
+    g = gate_g0(corpus, provo)
+    assert g["passed"], g
+    assert g["rows_not_normalised"] == 0
+    assert g["degenerate_targets"] == 0
+
+
+def test_responses_are_conserved_by_the_candidate_set(built):
+    """Every response either lands on a candidate or in the bucket; none is lost."""
+    provo, corpus, words, keys = built
+    for (tid, wn), tgt, ws in zip(keys, corpus, words):
+        grp = provo.responses[(provo.responses["text_id"] == tid)
+                              & (provo.responses["word_number"] == wn)]
+        assert tgt.N == pytest.approx(float(grp["count"].sum()))
+        assert OOV in ws
+
+
+def test_the_corpus_word_is_in_its_own_candidate_set(built):
+    provo, corpus, words, keys = built
+    wmap = {(int(r.text_id), int(r.word_number)): str(r.word)
+            for r in provo.words.itertuples()}
+    for (tid, wn), tgt, ws in zip(keys, corpus, words):
+        assert tgt.target_slot >= 0
+        assert ws[tgt.target_slot] == canonical_word(wmap[(tid, wn)])
+
+
+def test_prior_mention_flags_words_already_seen_in_the_passage(built):
+    provo, corpus, words, keys = built
+    for (tid, wn), tgt, ws in zip(keys, corpus, words):
+        seen = {canonical_word(x) for x in provo.passages[tid][: wn - 1]}
+        assert [bool(x) for x in tgt.g] == [w in seen for w in ws]
+
+
+def test_features_have_the_documented_columns(built):
+    _, corpus, _, _ = built
+    assert corpus.M == 4
+    assert corpus.feature_names == ["log_unigram", "length", "is_content", "log_docfreq"]
+    assert np.all(np.isfinite(corpus.target(0).f))
+
+
+def test_built_corpus_survives_a_disk_round_trip_and_a_fit(built, tmp_path):
+    _, corpus, _, _ = built
+    p = tmp_path / "cache.npz"
+    save_corpus(p, corpus)
+    back = load_corpus(p)
+    th = np.array([0.3, 0.1, 0.9])
+    assert loglik(back, th, NAIVE) == pytest.approx(loglik(corpus, th, NAIVE), rel=1e-4)
+    f = fit(back, NAIVE, n_starts=2, seed=0)
+    assert np.isfinite(f.loglik) and f.delta >= 0.0
+
+
+def test_gaze_table_aligns_to_the_built_targets_and_never_imputes(built):
+    provo, corpus, _, keys = built
+    y, ctrl, passage = gaze_table(provo, keys, load_subtlex(None))
+    assert y.shape == (len(corpus),)
+    assert ctrl.shape == (len(corpus), 2)
+    assert list(passage) == [t for t, _ in keys]
+    # Passage 2 words 2 and 6 have no eye-tracking record in the fixture.
+    missing = {(t, w) for (t, w), v in zip(keys, y) if not np.isfinite(v)}
+    assert missing == {(2, 2), (2, 6)}
+
+
+def test_window_surprisal_is_finite_where_the_target_word_is_a_candidate(built):
+    _, corpus, _, _ = built
+    s = window_surprisal(corpus, 2)
+    assert s.shape == (len(corpus),)
+    assert np.all(np.isfinite(s))
+    assert np.all(s > 0)
+
+
+def test_a_selection_predicate_restricts_the_build(provo_dir, scorer):
+    provo = load_provo(provo_dir)
+    keys = []
+    sub = build_corpus(provo, scorer, load_subtlex(None),
+                       BuildConfig(max_candidates=20, max_depth=4, top_k_expansions=0),
+                       select=lambda tid, wn, K: K <= 2, keep_keys=keys)
+    assert len(sub) == len(keys) > 0
+    assert all(t.K <= 2 for t in sub)
+
+
+def test_an_empty_build_says_what_to_check(provo_dir, scorer):
+    provo = load_provo(provo_dir)
+    with pytest.raises(ValueError, match="no target survived"):
+        build_corpus(provo, scorer, load_subtlex(None),
+                     BuildConfig(top_k_expansions=0),
+                     select=lambda tid, wn, K: False)

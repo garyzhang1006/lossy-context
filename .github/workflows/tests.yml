@@ -1,0 +1,32 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          # The CPU wheel keeps the runner under its disk limit; the packed
+          # forward-pass tests need a real transformer but not a real GPU.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[rt,dev]" "transformers>=4.40"
+      - name: Self-test
+        run: lcsa selftest --out /tmp/selftest
+      - name: Test suite
+        run: pytest -q
