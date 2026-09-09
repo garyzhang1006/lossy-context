@@ -16,5 +16,5 @@ ENV="${LCSA_REPO:-$SLURM_SUBMIT_DIR}/slurm/env.sh"
 . "$ENV"
 CACHE="$(ref_dir "$E3_SELF_REF")/cache.npz"
 [ -f "$CACHE" ] || { echo "no cache at $CACHE; run slurm/build_refs.sbatch first" >&2; exit 1; }
-lcsa e3 --cache "$CACHE" --out "$LCSA_ROOT/artifacts/self_${E3_SELF_REF//\//_}" \
+lcsa e3 --kernel "$LCSA_KERNEL" --cache "$CACHE" --out "$LCSA_ART/self_${E3_SELF_REF//\//_}" \
     --nulls none --readers N0 --no-human --n-rep "$N_REP"

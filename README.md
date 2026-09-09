@@ -151,9 +151,24 @@ N-TOPIC and N-ORDER tilts that `e3 --stage prepare` calibrated as two further
 references at no GPU cost. The self-reference certification of the plain floor
 is `lcsa e3 --cache GPT2_SMALL_CACHE --nulls none --readers N0 --no-human`.
 `build` also writes `perplexity.json`, the reference's token perplexity over
-the Provo passages, and `lcsa confounds --reference gpt2=DIR ...` fits the
-human counts under each reference cache and prints that perplexity beside
-every delta, labelled as a competence confound rather than a null.
+the Provo passages with a Min-K% score per passage, and `g1.json`, the
+sustained TFLOP/s of the build priced at 2N FLOP per parameter per token
+forwarded plus a ten percent attention surcharge, against the registered
+2.0 threshold. `lcsa confounds --reference gpt2=DIR ...` fits the human
+counts under each reference cache and prints that perplexity beside every
+delta, labelled as a competence confound rather than a null, and refits the
+human counts within tertiles of the primary reference's Min-K% score as the
+contamination check.
+
+### Kernel and frozen outputs
+
+Every experiment takes `--kernel power` (the registered run) or
+`--kernel linear`, Kuribayashi's erasure, for the robustness appendix. The
+prepared E3 state and the E2 nuisance vector record the kernel they were
+fitted under and refuse a later stage under the other one, so the two runs
+go to separate `--out` directories. `lcsa manifest --out DIR` writes a
+SHA-256 for every artifact and `--check` exits 1 on any drift, which is how
+the numbers in the paper are tied to the files they came from.
 
 ## Kaggle
 

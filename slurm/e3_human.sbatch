@@ -17,12 +17,12 @@ set -euo pipefail
 ENV="${LCSA_REPO:-$SLURM_SUBMIT_DIR}/slurm/env.sh"
 [ -f "$ENV" ] || { echo "submit from the repository root or export LCSA_REPO" >&2; exit 2; }
 . "$ENV"
-CACHE="$LCSA_ROOT/build/cache.npz"; OUT="$LCSA_ROOT/artifacts"
+CACHE="$LCSA_ROOT/build/cache.npz"; OUT="$LCSA_ART"
 if [ "$SLURM_ARRAY_TASK_ID" -eq 0 ]; then
-    lcsa e3 --cache "$CACHE" --out "$OUT" --stage human
+    lcsa e3 --kernel "$LCSA_KERNEL" --cache "$CACHE" --out "$OUT" --stage human
 else
     N=$SLURM_ARRAY_TASK_MAX
     read -r START STOP <<< "$(shard_range $(( SLURM_ARRAY_TASK_ID - 1 )) "$N" "$N_BOOT")"
-    lcsa e3 --cache "$CACHE" --out "$OUT" --stage contrast --n-boot "$N_BOOT" \
+    lcsa e3 --kernel "$LCSA_KERNEL" --cache "$CACHE" --out "$OUT" --stage contrast --n-boot "$N_BOOT" \
         --boot-start "$START" --boot-stop "$STOP"
 fi

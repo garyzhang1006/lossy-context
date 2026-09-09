@@ -266,25 +266,45 @@ def build_corpus(
     )
 
 
+MIN_K_FRAC = 0.2
+
+
+def min_k_logprob(nll: np.ndarray, frac: float = MIN_K_FRAC) -> float:
+    """Min-K% Prob of Shi et al. (2024): mean log-probability of the ``frac``
+    least likely tokens.  A passage the reference has memorised has few
+    surprising tokens, so its score sits high; the confound table splits Provo
+    into tertiles of this score to show whether fitted decay tracks it."""
+    nll = np.asarray(nll, dtype=np.float64)
+    if nll.size == 0:
+        return float("nan")
+    k = max(1, int(np.ceil(frac * nll.size)))
+    worst = np.sort(nll)[-k:]
+    return float(-worst.mean())
+
+
 def provo_perplexity(provo: ProvoData, scorer) -> dict:
-    """Token perplexity of the reference over the Provo passages.
+    """Token perplexity and Min-K% of the reference over the Provo passages.
 
     Printed beside every competence confound's ``delta_hat`` so a reader can see
-    that a weaker model is a weaker model and not a zero-decay null.
+    that a weaker model is a weaker model and not a zero-decay null, and used
+    to split the human fit into contamination tertiles.
     """
-    total, count, per = 0.0, 0, {}
+    total, count, per, mink = 0.0, 0, {}, {}
     for tid, ws in provo.passages.items():
-        nll, n = scorer.passage_nll(ws)
+        nll, n, tokens = scorer.passage_nll(ws)
         total += nll
         count += n
         per[int(tid)] = float(np.exp(nll / n)) if n else float("nan")
+        mink[int(tid)] = min_k_logprob(tokens)
     return {
         "model": getattr(scorer, "model_name", "?"),
         "n_passages": len(per),
         "n_tokens": int(count),
         "mean_token_nll": float(total / count) if count else float("nan"),
         "perplexity": float(np.exp(total / count)) if count else float("nan"),
+        "min_k_frac": MIN_K_FRAC,
         "per_passage": per,
+        "per_passage_min_k": mink,
     }
 
 

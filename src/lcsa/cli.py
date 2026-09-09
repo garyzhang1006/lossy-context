@@ -114,6 +114,7 @@ def cmd_build(args) -> int:
                           progress=progress, keep_words=words, keep_keys=keys,
                           candidates=frozen)
     dt = time.time() - t0
+    tokens = int(getattr(scorer, "tokens_forwarded", 0))
     log.info("built %d targets in %.1f s", len(corpus), dt)
     if frozen is not None and args.limit is None and keys != frozen_keys:
         raise SystemExit(
@@ -130,19 +131,29 @@ def cmd_build(args) -> int:
              ppl["perplexity"], ppl["n_tokens"])
 
     # G1 is a throughput measurement, so it is reported from the build itself
-    # rather than from a separate benchmark that could differ in shape.
+    # rather than from a separate benchmark that could differ in shape.  The
+    # price is the registered one: 2N FLOP per parameter per token forwarded
+    # plus a ten percent attention surcharge at these short prefixes.
     ctx = sum(t.K + 1 for t in corpus)
+    n_params = int(getattr(scorer, "n_params", 0))
+    tflops = 2.2 * n_params * tokens / dt / 1e12 if dt > 0 and n_params else float("nan")
+    g1 = g1_throughput(tflops, reference=args.model)
     (out / "g1.json").write_text(json.dumps({
         "seconds": dt, "targets": len(corpus), "contexts": ctx,
         "contexts_per_second": ctx / dt if dt > 0 else None,
-        "note": "TFLOP/s requires the checkpoint's FLOP count; "
-                "contexts per second is the portable form",
-    }, indent=2))
+        "tokens_forwarded": tokens, "n_params": n_params, "tflops": tflops,
+        "passed": g1.passed, "threshold": 2.0,
+        "note": "below 2.0 TFLOP/s the registration swaps the primary reference to "
+                "Qwen2.5-0.5B before G3 and G4 run",
+    }, indent=2, default=str))
+    log.info("G1 %s: %.2f TFLOP/s over %d tokens", "passed" if g1.passed else "FAILED",
+             tflops, tokens)
     g2 = gate_g0(corpus, provo)
     (out / "g0_cache.json").write_text(json.dumps(g2, indent=2, default=str))
     print(json.dumps({"targets": len(corpus), "clusters": corpus.n_clusters,
-                      "mean_K": corpus.mean_K, "seconds": dt,
-                      "cache": str(out / "cache.npz")}, indent=2))
+                      "mean_K": corpus.mean_K, "seconds": dt, "tflops": tflops,
+                      "g1_passed": g1.passed, "cache": str(out / "cache.npz")},
+                     indent=2, default=str))
     return 0
 
 
@@ -155,6 +166,15 @@ def _load(args):
     return load_corpus(p)
 
 
+def _kernel(args):
+    from lcsa.kernels import KERNELS
+
+    name = getattr(args, "kernel", "power")
+    if name not in KERNELS:
+        raise SystemExit(f"--kernel must be one of {sorted(KERNELS)}, got {name!r}")
+    return KERNELS[name]
+
+
 def _models(names):
     from lcsa.likelihood import get_model
 
@@ -165,7 +185,8 @@ def cmd_e1(args) -> int:
     from lcsa.experiments.e1_exactness import run
 
     corpus = _load(args)
-    res = run(corpus, _models(args.estimators), args.out, seed=args.seed)
+    res = run(corpus, _models(args.estimators), args.out, kernel=_kernel(args),
+              seed=args.seed)
     print(json.dumps({"exactness_passed": res["exactness"]["passed"],
                       "gradients_passed": all(g["passed"] for g in res["gradients"]),
                       "g2_passed": res["g2"].passed}, indent=2))
@@ -193,6 +214,7 @@ def cmd_e2(args) -> int:
 
     corpus = _load(args)
     models = _models(args.estimators)
+    kernel = _kernel(args)
     gen = corpus
     if args.gen_cache:
         gp = Path(args.gen_cache)
@@ -207,25 +229,31 @@ def cmd_e2(args) -> int:
         # The nuisance vector comes from the human counts under the primary
         # estimator and is written once, so every coverage shard reads the same
         # numbers instead of refitting them on a node with a different BLAS.
-        theta0 = fit_constrained(corpus, models[0], n_starts=3, seed=args.seed).theta
+        theta0 = fit_constrained(corpus, models[0], kernel, n_starts=3, seed=args.seed).theta
         theta_path.parent.mkdir(parents=True, exist_ok=True)
         theta_path.write_text(json.dumps({"theta0": [float(x) for x in theta0],
                                           "estimator": models[0].name,
+                                          "kernel": kernel.name,
                                           "gen_cache": args.gen_cache}))
     else:
         if not theta_path.exists():
             raise SystemExit(f"{theta_path} is missing; run `lcsa e2 --stage ladder` first")
-        theta0 = np.asarray(json.loads(theta_path.read_text())["theta0"], dtype=np.float64)
+        rec = json.loads(theta_path.read_text())
+        if rec.get("kernel", "power") != kernel.name:
+            raise SystemExit(f"{theta_path} was written under the {rec.get('kernel', 'power')!r} "
+                             f"kernel; pass the same --kernel or use another --out")
+        theta0 = np.asarray(rec["theta0"], dtype=np.float64)
     if args.stage == "all":
-        res = e2.run(gen, corpus, theta0, models, args.out, n_rep=args.n_rep, seed=args.seed)
+        res = e2.run(gen, corpus, theta0, models, args.out, kernel=kernel, n_rep=args.n_rep,
+                     seed=args.seed)
     elif args.stage == "ladder":
-        e2.run_ladder(gen, corpus, theta0, models, args.out, seed=args.seed)
+        e2.run_ladder(gen, corpus, theta0, models, args.out, kernel=kernel, seed=args.seed)
         _print({"stage": "ladder", "out": args.out})
         return 0
     else:
         reps = _rep_range(args, args.n_rep)
         rows = e2.run_coverage_shard(gen, corpus, theta0, models, args.out, reps,
-                                     seed=args.seed)
+                                     kernel=kernel, seed=args.seed)
         _print({"stage": "coverage", "replicates": [reps.start, reps.stop],
                 "rows": len(rows), "failed": sum(1 for r in rows if r.get("failed"))})
         return 0
@@ -272,11 +300,12 @@ def cmd_e3(args) -> int:
 
     corpus = _load(args)
     models = _models(args.estimators)
+    kernel = _kernel(args)
     readers = ([x.strip() for x in args.readers.split(",") if x.strip()]
                if args.readers else None)
     if args.stage == "all":
         res = e3.run(corpus, models, args.out, h_specs=_e3_h_specs(args, corpus) or None,
-                     n_rep=args.n_rep, n_boot=args.n_boot, seed=args.seed,
+                     kernel=kernel, n_rep=args.n_rep, n_boot=args.n_boot, seed=args.seed,
                      fit_human=not args.no_human, readers=readers)
         _print({"g5_passed": res["g5"].passed,
                 "rates": [{k: r[k] for k in ("reader", "estimator", "reject_cluster_robust",
@@ -285,7 +314,7 @@ def cmd_e3(args) -> int:
         return 0
     if args.stage == "prepare":
         prep = e3.prepare(corpus, models, args.out, _e3_h_specs(args, corpus) or None,
-                          seed=args.seed, readers=readers)
+                          kernel=kernel, seed=args.seed, readers=readers)
         _print({"stage": "prepare", "readers": list(prep["readers"]),
                 "calibration": prep["calibration"]})
         return 0
@@ -295,17 +324,18 @@ def cmd_e3(args) -> int:
         out = {}
         for nm in readers or list(prep["readers"]):
             rows = e3.run_replicate_shard(corpus, prep, models, args.out, nm, reps,
-                                          seed=args.seed)
+                                          kernel=kernel, seed=args.seed)
             out[nm] = {"rows": len(rows), "failed": sum(1 for r in rows if r["failed"])}
         _print({"stage": "replicates", "replicates": [reps.start, reps.stop], "readers": out})
     elif args.stage == "human":
-        human = e3.run_human(corpus, prep, models, args.out, seed=args.seed)
+        human = e3.run_human(corpus, prep, models, args.out, kernel=kernel, seed=args.seed)
         _print({"stage": "human", "fits": [{k: f[k] for k in ("estimator", "delta_hat",
                                                               "p_headline")}
                                            for f in human["fits"]]})
     else:
         reps = _rep_range(args, args.n_boot, "boot_start", "boot_stop")
-        recs = e3.run_contrast_shard(corpus, prep, models, args.out, reps, seed=args.seed)
+        recs = e3.run_contrast_shard(corpus, prep, models, args.out, reps, kernel=kernel,
+                                     seed=args.seed)
         _print({"stage": "contrast", "replicates": [reps.start, reps.stop], "rows": len(recs)})
     return 0
 
@@ -357,17 +387,19 @@ def cmd_e4(args) -> int:
     unigrams = load_subtlex(args.subtlex)
     y, ctrl, passage = e4.gaze_table(provo, keys, unigrams)
     refs = _e4_references(args, corpus, keys)
+    kernel = _kernel(args)
     if args.stage in ("all", "sweep"):
-        f = fit(corpus, models[0], n_starts=3, seed=args.seed)
+        f = fit(corpus, models[0], kernel, n_starts=3, seed=args.seed)
         fitted = {"human": (f.theta, models[0])}
     if args.stage == "all":
         res = e4.run(corpus, y, ctrl, passage, models, args.out, references=refs,
                      fitted=fitted, n_boot=args.n_boot, n_folds=args.n_folds,
-                     seed=args.seed)
+                     kernel=kernel, seed=args.seed)
         _print({"selected_k": res["selected"], "prediction_8": res["prediction_8"]})
     elif args.stage == "sweep":
         stage = e4.run_sweep(corpus, y, ctrl, passage, models, args.out, references=refs,
-                             fitted=fitted, n_folds=args.n_folds, seed=args.seed)
+                             fitted=fitted, n_folds=args.n_folds, kernel=kernel,
+                             seed=args.seed)
         _print({"stage": "sweep", "selected_k": {n: s["argmax_k"]
                                                  for n, s in stage["sweeps"].items()}})
     else:
@@ -384,6 +416,17 @@ def cmd_confounds(args) -> int:
     from lcsa.store import load_corpus
 
     models = _models(args.estimators)
+    primary = None
+    if args.cache:
+        cp = Path(args.cache)
+        if not cp.exists():
+            raise SystemExit(f"primary cache not found: {cp}; pass --cache '' to skip the "
+                             "Min-K% tertile rows")
+        pp = cp.parent / "perplexity.json"
+        ppl = json.loads(pp.read_text()) if pp.exists() else None
+        if ppl is None:
+            log.warning("%s has no perplexity.json beside it; no Min-K%% tertile rows", cp)
+        primary = (load_corpus(cp), ppl)
     refs = {}
     for spec in args.reference:
         if "=" not in spec:
@@ -396,9 +439,21 @@ def cmd_confounds(args) -> int:
         if (d / "perplexity.json").exists():
             ppl = json.loads((d / "perplexity.json").read_text())
         refs[name] = (load_corpus(d / "cache.npz"), ppl)
-    rows = run(refs, models, args.out, seed=args.seed)
-    _print([{k: r[k] for k in ("reader", "estimator", "delta_hat", "p_headline",
-                                "perplexity")} for r in rows])
+    rows = run(refs, models, args.out, kernel=_kernel(args), seed=args.seed, primary=primary)
+    _print([{k: r[k] for k in ("reader", "kind", "tertile", "estimator", "delta_hat",
+                                "p_headline", "perplexity")} for r in rows])
+    return 0
+
+
+def cmd_manifest(args) -> int:
+    from lcsa.manifest import check_manifest, write_manifest
+
+    if args.check:
+        rep = check_manifest(args.out, args.name)
+        _print(rep)
+        return 0 if rep["ok"] else 1
+    rec = write_manifest(args.out, args.name)
+    _print({"manifest": str(Path(args.out) / args.name), "n_files": rec["n_files"]})
     return 0
 
 
@@ -532,6 +587,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--out", default="artifacts")
         sp.add_argument("--estimators", nargs="+", default=["naive", "repaired"])
         sp.add_argument("--seed", type=int, default=0)
+        sp.add_argument("--kernel", choices=["power", "linear"], default="power",
+                        help="retention kernel; linear is the Kuribayashi robustness refit")
 
     e1 = sub.add_parser("e1", help="exactness, sensitivity, residual fractions")
     common(e1)
@@ -591,10 +648,21 @@ def build_parser() -> argparse.ArgumentParser:
     cf = sub.add_parser("confounds", help="competence confounds: fits with perplexity")
     cf.add_argument("--reference", action="append", required=True, metavar="NAME=DIR",
                     help="a build directory with cache.npz and perplexity.json; repeatable")
+    cf.add_argument("--cache", default="artifacts/build/cache.npz",
+                    help="primary cache whose perplexity.json drives the Min-K%% tertiles; "
+                         "an empty string skips them")
     cf.add_argument("--out", default="artifacts")
     cf.add_argument("--estimators", nargs="+", default=["naive", "repaired"])
     cf.add_argument("--seed", type=int, default=0)
+    cf.add_argument("--kernel", choices=["power", "linear"], default="power")
     cf.set_defaults(func=cmd_confounds)
+
+    mf = sub.add_parser("manifest", help="sha256 of every artifact, or check one")
+    mf.add_argument("--out", default="artifacts")
+    mf.add_argument("--name", default="manifest.json")
+    mf.add_argument("--check", action="store_true",
+                    help="compare the directory against the manifest; exit 1 on drift")
+    mf.set_defaults(func=cmd_manifest)
 
     mg = sub.add_parser("merge", help="combine shards into the registered tables")
     mg.add_argument("--out", default="artifacts")

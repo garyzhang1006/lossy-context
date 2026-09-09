@@ -135,11 +135,15 @@ class ReferenceScorer:
         self.max_prefix_tokens = int(max_prefix_tokens)
         self.path = path
         self._resolved = None
+        # G1 is priced as 2N FLOP per parameter per token forwarded, so the
+        # scorer counts tokens across every path and exposes N.
+        self.n_params = int(sum(p.numel() for p in self.model.parameters()))
+        self.tokens_forwarded = 0
 
     # -- low level ------------------------------------------------------
 
-    def passage_nll(self, words: Sequence[str]) -> tuple[float, int]:
-        """Summed token negative log-likelihood of one passage and its token count.
+    def passage_nll(self, words: Sequence[str]) -> tuple[float, int, np.ndarray]:
+        """Summed token negative log-likelihood, token count, and per-token NLLs.
 
         The passage is scored as the model reads it, from the bos token if the
         tokeniser has one, in windows of ``max_prefix_tokens`` with the first
@@ -150,20 +154,24 @@ class ReferenceScorer:
         torch = self.torch
         text = " ".join(str(w) for w in words)
         ids = self._prefix_ids("") + self.tok.encode(text, add_special_tokens=False)
-        total, count = 0.0, 0
+        total, count, per_token = 0.0, 0, []
         step = self.max_prefix_tokens
         start = 0
         while start + 1 < len(ids):
             chunk = ids[start:start + step + 1]
             x = torch.tensor([chunk], dtype=torch.long, device=self.device)
+            self.tokens_forwarded += int(x.numel())
             with torch.no_grad():
                 logits = self.model(input_ids=x).logits[0, :-1, :].float()
             lp = torch.log_softmax(logits, dim=-1)
             tgt = x[0, 1:]
-            total += float(-lp.gather(1, tgt[:, None]).sum())
+            nll = (-lp.gather(1, tgt[:, None])[:, 0]).double().cpu().numpy()
+            per_token.append(nll)
+            total += float(nll.sum())
             count += int(tgt.numel())
             start += step
-        return total, count
+        flat = np.concatenate(per_token) if per_token else np.zeros(0)
+        return total, count, flat.astype(np.float64)
 
     def _prefix_ids(self, context: str) -> list[int]:
         if not context:
@@ -201,6 +209,7 @@ class ReferenceScorer:
         # arange(maxlen), which would shift every short row's positions and make
         # this "reference" path quietly wrong.
         pos = (att.cumsum(dim=1) - 1).clamp(min=0)
+        self.tokens_forwarded += int(ids.numel())
         with torch.no_grad():
             logits = self.model(input_ids=ids, attention_mask=att, position_ids=pos).logits
         lp = torch.log_softmax(logits[:, -1, :].float(), dim=-1).cpu().numpy()
@@ -216,6 +225,7 @@ class ReferenceScorer:
         neg = torch.finfo(self.dtype).min
         add = torch.where(mm, torch.zeros((), dtype=self.dtype, device=self.device),
                           torch.full((), neg, dtype=self.dtype, device=self.device))
+        self.tokens_forwarded += int(ii.numel())
         with torch.no_grad():
             logits = self.model(input_ids=ii, attention_mask=add, position_ids=pp).logits
         lp = torch.log_softmax(logits[0].float(), dim=-1).cpu().numpy()

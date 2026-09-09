@@ -242,6 +242,29 @@ def test_passage_perplexity_is_finite_and_counts_every_token(built, scorer):
     assert rec["n_tokens"] == n_expected
     assert np.isfinite(rec["perplexity"]) and rec["perplexity"] > 1.0
     assert set(rec["per_passage"]) == set(provo.passages)
+    assert set(rec["per_passage_min_k"]) == set(provo.passages)
+    # Min-K% averages the least likely fifth, so it sits at or below the mean.
+    for tid, ws in provo.passages.items():
+        nll, n, tokens = scorer.passage_nll(ws)
+        assert tokens.shape == (n,) and abs(tokens.sum() - nll) < 1e-6
+        assert rec["per_passage_min_k"][tid] <= -nll / n + 1e-9
+
+
+def test_build_writes_g1_from_tokens_forwarded(provo_dir, scorer, tmp_path, monkeypatch):
+    import lcsa.cache
+    from lcsa.cli import main
+
+    # The CLI constructs the scorer from a checkpoint name; hand it the fixture.
+    monkeypatch.setattr(lcsa.cache, "ReferenceScorer", lambda *a, **k: scorer)
+    out = tmp_path / "b"
+    assert main(["build", "--provo-dir", str(provo_dir), "--model", "test-tiny",
+                 "--out", str(out), "--max-depth", "3", "--max-candidates", "12",
+                 "--top-k", "0"]) == 0
+    g1 = json.loads((out / "g1.json").read_text())
+    assert g1["tokens_forwarded"] > 0 and g1["n_params"] > 0
+    assert np.isfinite(g1["tflops"]) and g1["passed"] is False
+    ppl = json.loads((out / "perplexity.json").read_text())
+    assert ppl["min_k_frac"] == 0.2 and len(ppl["per_passage_min_k"]) == 2
 
 
 def test_confounds_command_prints_delta_beside_perplexity(built, tmp_path):
@@ -253,9 +276,28 @@ def test_confounds_command_prints_delta_beside_perplexity(built, tmp_path):
     save_corpus(d / "cache.npz", corpus)
     (d / "perplexity.json").write_text(json.dumps({"perplexity": 12.5, "n_tokens": 100}))
     out = tmp_path / "art"
-    assert main(["confounds", "--reference", f"gpt2={d}", "--out", str(out),
-                 "--estimators", "naive"]) == 0
+    assert main(["confounds", "--reference", f"gpt2={d}", "--cache", str(d / "cache.npz"),
+                 "--out", str(out), "--estimators", "naive"]) == 0
     rows = json.loads((out / "confounds.json").read_text())["rows"]
     assert rows[0]["reader"] == "gpt2" and rows[0]["perplexity"] == 12.5
     assert rows[0]["kind"] == "competence confound"
     assert np.isfinite(rows[0]["delta_hat"])
+    # Two passages cannot form three tertiles of two, so no tertile rows appear.
+    assert all(r["kind"] == "competence confound" for r in rows)
+
+
+def test_min_k_tertiles_refit_the_human_counts_by_passage(corpus, tmp_path):
+    from lcsa.experiments.confounds import min_k_tertiles, run
+    from lcsa.likelihood import NAIVE
+
+    ppl = {"perplexity": 20.0, "n_tokens": 500,
+           "per_passage_min_k": {str(int(c)): -float(i) for i, c in enumerate(corpus.cluster_ids)}}
+    tert = min_k_tertiles(corpus, ppl)
+    assert [t for t, *_ in tert] == [1, 2, 3]
+    assert sum(len(idx) for _, idx, _, _ in tert) == corpus.n_clusters
+    assert tert[0][2] <= tert[0][3] <= tert[1][2]
+    rows = run({}, [NAIVE], tmp_path, primary=(corpus, ppl))
+    assert [r["tertile"] for r in rows] == [1, 2, 3]
+    assert all(r["kind"] == "min-k tertile" and np.isfinite(r["delta_hat"]) for r in rows)
+    assert sum(r["n_clusters"] for r in rows) == corpus.n_clusters
+    assert min_k_tertiles(corpus, {"per_passage_min_k": {}}) == []

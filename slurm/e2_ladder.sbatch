@@ -16,4 +16,4 @@ ENV="${LCSA_REPO:-$SLURM_SUBMIT_DIR}/slurm/env.sh"
 CACHE="$LCSA_ROOT/build/cache.npz"; GEN="$(ref_dir "$E2_GEN_REF")/cache.npz"
 [ -f "$CACHE" ] || { echo "no cache at $CACHE; run slurm/build.sbatch first" >&2; exit 1; }
 [ -f "$GEN" ] || { echo "no generating cache at $GEN; run slurm/build_refs.sbatch first" >&2; exit 1; }
-lcsa e2 --cache "$CACHE" --gen-cache "$GEN" --out "$LCSA_ROOT/artifacts" --stage ladder
+lcsa e2 --kernel "$LCSA_KERNEL" --cache "$CACHE" --gen-cache "$GEN" --out "$LCSA_ART" --stage ladder

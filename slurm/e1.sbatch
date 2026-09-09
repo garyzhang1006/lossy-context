@@ -14,4 +14,4 @@ ENV="${LCSA_REPO:-$SLURM_SUBMIT_DIR}/slurm/env.sh"
 . "$ENV"
 CACHE="$LCSA_ROOT/build/cache.npz"
 [ -f "$CACHE" ] || { echo "no cache at $CACHE; run slurm/build.sbatch first" >&2; exit 1; }
-lcsa e1 --cache "$CACHE" --out "$LCSA_ROOT/artifacts"
+lcsa e1 --kernel "$LCSA_KERNEL" --cache "$CACHE" --out "$LCSA_ART"

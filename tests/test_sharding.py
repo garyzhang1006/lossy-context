@@ -216,3 +216,39 @@ def test_cli_self_reference_run_prepares_the_plain_floor_alone(corpus, tmp_path)
     rates = json.loads((out / "e3_summary.json").read_text())["rejection_rates"]
     assert {r["reader"] for r in rates} == {"N0"}
     assert json.loads((out / "e3_summary.json").read_text())["human"] is None
+
+
+def test_prepared_stage_refuses_another_kernel(null_corpus, tmp_path):
+    from lcsa.experiments import e3_nulls as e3
+    from lcsa.kernels import LINEAR
+    from lcsa.likelihood import NAIVE
+
+    prep = e3.prepare(null_corpus, [NAIVE], tmp_path, None, seed=0, readers=["N0"])
+    assert prep["kernel"] == "power"
+    loaded = e3.load_prepared(tmp_path, null_corpus)
+    assert loaded["kernel"] == "power"
+    with pytest.raises(ValueError, match="--kernel power"):
+        e3.run_human(null_corpus, loaded, [NAIVE], tmp_path, kernel=LINEAR)
+    with pytest.raises(ValueError, match="--kernel power"):
+        e3.run_replicate_shard(null_corpus, loaded, [NAIVE], tmp_path, "N0", range(0, 1),
+                               kernel=LINEAR)
+
+
+def test_cli_runs_the_linear_kernel_end_to_end(null_corpus, tmp_path):
+    from lcsa.cli import main
+    from lcsa.store import save_corpus
+
+    cache = tmp_path / "cache.npz"
+    save_corpus(cache, null_corpus)
+    out = tmp_path / "lin"
+    args = ["--cache", str(cache), "--out", str(out), "--estimators", "naive",
+            "--kernel", "linear"]
+    assert main(["e3", *args, "--nulls", "none", "--readers", "N0", "--n-rep", "2",
+                 "--n-boot", "2"]) == 0
+    prep = json.loads((out / "e3_prepared.json").read_text())
+    assert prep["kernel"] == "linear"
+    assert main(["e2", *args, "--stage", "ladder"]) == 0
+    assert json.loads((out / "e2_theta0.json").read_text())["kernel"] == "linear"
+    with pytest.raises(SystemExit, match="kernel"):
+        main(["e2", "--cache", str(cache), "--out", str(out), "--estimators", "naive",
+              "--stage", "coverage", "--n-rep", "1", "--rep-start", "0", "--rep-stop", "1"])

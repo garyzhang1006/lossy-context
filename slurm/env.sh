@@ -46,6 +46,12 @@ export E3_READERS="${E3_READERS:-N0 N0-PRIME N-LEX N-TOPIC N-ORDER}"
 export LCSA_REFS="${LCSA_REFS:-gpt2-large gpt2 Qwen/Qwen2.5-0.5B}"
 export E2_GEN_REF="${E2_GEN_REF:-gpt2-large}"
 export E3_SELF_REF="${E3_SELF_REF:-gpt2}"
+# Retention kernel.  "power" is the registered run; LCSA_KERNEL=linear reruns
+# the same jobs for the Kuribayashi robustness table into artifacts_linear so
+# the two never overwrite each other.
+export LCSA_KERNEL="${LCSA_KERNEL:-power}"
+if [ "$LCSA_KERNEL" = power ]; then export LCSA_ART="$LCSA_ROOT/artifacts"
+else export LCSA_ART="$LCSA_ROOT/artifacts_$LCSA_KERNEL"; fi
 
 # shard_range I N TOTAL -> "start stop" for array task I of N over [0, TOTAL).
 shard_range() {

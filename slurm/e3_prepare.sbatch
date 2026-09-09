@@ -19,6 +19,6 @@ ENV="${LCSA_REPO:-$SLURM_SUBMIT_DIR}/slurm/env.sh"
 B="$LCSA_ROOT/build"
 [ -f "$B/cache.npz" ] || { echo "no cache at $B/cache.npz; run slurm/build.sbatch first" >&2; exit 1; }
 python -c 'import torch; assert torch.cuda.is_available(), "no CUDA device visible"'
-lcsa e3 --cache "$B/cache.npz" --out "$LCSA_ROOT/artifacts" --stage prepare \
+lcsa e3 --kernel "$LCSA_KERNEL" --cache "$B/cache.npz" --out "$LCSA_ART" --stage prepare \
     --nulls "${NULLS:-lex,topic,order}" --provo-dir "$LCSA_PROVO" \
     --targets "$B/targets.csv" --candidates "$B/candidates.json" --model "$LCSA_MODEL"

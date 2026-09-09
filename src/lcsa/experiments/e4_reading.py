@@ -307,6 +307,7 @@ def run_sweep(
     k_grid=K_GRID,
     n_folds: int | None = None,
     use_mixed: bool = True,
+    kernel=POWER,
     seed: int = 0,
 ) -> dict:
     """Stage one of E4: every deterministic table, saved so the shards can skip it.
@@ -327,8 +328,8 @@ def run_sweep(
     stage = {"references": list(refs), "sweeps": sweeps,
              "model_free": context_slopes(corpus)}
     if fitted:
-        rows = rt_gain_table(corpus, gaze, controls, passage, fitted, n_folds=5,
-                             use_mixed=use_mixed, seed=seed)
+        rows = rt_gain_table(corpus, gaze, controls, passage, fitted, kernel=kernel,
+                             n_folds=5, use_mixed=use_mixed, seed=seed)
         art.table("e4_rt_gain", rows)
         stage["rt_gain"] = rows
     hw = hard_window_sweep(corpus, models[0], windows=tuple(k_grid), n_folds=5, seed=seed)
@@ -409,11 +410,12 @@ def run(
     n_boot: int = 200,
     n_folds: int | None = None,
     use_mixed: bool = True,
+    kernel=POWER,
     seed: int = 0,
 ) -> dict:
     """Full E4 leg: the sweep across references, the argmax bootstrap, the gains."""
     stage = run_sweep(corpus, gaze, controls, passage, models, out_dir, references,
-                      fitted, k_grid, n_folds, use_mixed, seed)
+                      fitted, k_grid, n_folds, use_mixed, kernel, seed)
     rows = run_argmax_shard(corpus, gaze, controls, passage, out_dir, range(n_boot),
                             references, k_grid, seed)
     return assemble(stage, rows, out_dir)

@@ -15,5 +15,6 @@ ENV="${LCSA_REPO:-$SLURM_SUBMIT_DIR}/slurm/env.sh"
 [ -f "$ENV" ] || { echo "submit from the repository root or export LCSA_REPO" >&2; exit 2; }
 . "$ENV"
 REFARGS=(); for m in $LCSA_REFS; do REFARGS+=(--reference "${m//\//_}=$(ref_dir "$m")"); done
-lcsa confounds "${REFARGS[@]}" --out "$LCSA_ROOT/artifacts"
+lcsa confounds --kernel "$LCSA_KERNEL" "${REFARGS[@]}" --cache "$LCSA_ROOT/build/cache.npz" \
+    --out "$LCSA_ART"
 cat "$LCSA_ROOT/artifacts/confounds.csv"

@@ -21,6 +21,6 @@ ENV="${LCSA_REPO:-$SLURM_SUBMIT_DIR}/slurm/env.sh"
 read -ra READERS <<< "$E3_READERS"
 READER="${READERS[$(( SLURM_ARRAY_TASK_ID / E3_SHARDS ))]}"
 read -r START STOP <<< "$(shard_range $(( SLURM_ARRAY_TASK_ID % E3_SHARDS )) "$E3_SHARDS" "$N_REP")"
-lcsa e3 --cache "$LCSA_ROOT/build/cache.npz" --out "$LCSA_ROOT/artifacts" \
+lcsa e3 --kernel "$LCSA_KERNEL" --cache "$LCSA_ROOT/build/cache.npz" --out "$LCSA_ART" \
     --stage replicates --readers "$READER" --n-rep "$N_REP" \
     --rep-start "$START" --rep-stop "$STOP"

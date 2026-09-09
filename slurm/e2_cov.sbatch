@@ -19,5 +19,5 @@ ENV="${LCSA_REPO:-$SLURM_SUBMIT_DIR}/slurm/env.sh"
 CACHE="$LCSA_ROOT/build/cache.npz"; GEN="$(ref_dir "$E2_GEN_REF")/cache.npz"
 N=$(( SLURM_ARRAY_TASK_MAX + 1 ))
 read -r START STOP <<< "$(shard_range "$SLURM_ARRAY_TASK_ID" "$N" "$N_REP")"
-lcsa e2 --cache "$CACHE" --gen-cache "$GEN" --out "$LCSA_ROOT/artifacts" \
+lcsa e2 --kernel "$LCSA_KERNEL" --cache "$CACHE" --gen-cache "$GEN" --out "$LCSA_ART" \
     --stage coverage --n-rep "$N_REP" --rep-start "$START" --rep-stop "$STOP"

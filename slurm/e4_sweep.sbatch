@@ -14,7 +14,7 @@ set -euo pipefail
 ENV="${LCSA_REPO:-$SLURM_SUBMIT_DIR}/slurm/env.sh"
 [ -f "$ENV" ] || { echo "submit from the repository root or export LCSA_REPO" >&2; exit 2; }
 . "$ENV"
-B="$LCSA_ROOT/build"; OUT="$LCSA_ROOT/artifacts"
+B="$LCSA_ROOT/build"; OUT="$LCSA_ART"
 REFARGS=(); for m in $LCSA_REFS; do REFARGS+=(--reference "${m//\//_}=$(ref_dir "$m")"); done
-lcsa e4 --cache "$B/cache.npz" --out "$OUT" --stage sweep --provo-dir "$LCSA_PROVO" \
+lcsa e4 --kernel "$LCSA_KERNEL" --cache "$B/cache.npz" --out "$OUT" --stage sweep --provo-dir "$LCSA_PROVO" \
     --targets "$B/targets.csv" --subtlex "$LCSA_SUBTLEX" "${REFARGS[@]}" --tilted-from "$OUT"

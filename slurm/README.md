@@ -70,7 +70,7 @@ clock after the builds is set by the ladder and the sweep, a few hours each.
 | `e3_reps.sbatch` | scu-cpu | array of readers x `E3_SHARDS`, 4 cpu, 16000M | 12 h | null replicates per reader |
 | `e3_human.sbatch` | scu-cpu | array 0-`E3_BOOT_SHARDS`, 4 cpu, 16000M | 12 h | task 0 the human fit, the rest the paired contrast bootstrap |
 | `e3_self.sbatch` | scu-cpu | 4 cpu, 16000M | 24 h | the plain floor under the GPT-2-small cache |
-| `confounds.sbatch` | scu-cpu | 4 cpu, 16000M | 12 h | the human counts fitted under each reference cache, with its Provo perplexity |
+| `confounds.sbatch` | scu-cpu | 4 cpu, 16000M | 12 h | the human counts fitted under each reference cache with its Provo perplexity, plus the Min-K% tertile refits |
 | `e4_sweep.sbatch` | scu-cpu | 4 cpu, 32000M | 24 h | the sweep under six references, reading-time gains, hard-window likelihoods |
 | `e4_boot.sbatch` | scu-cpu | array of `E4_SHARDS`, 4 cpu, 32000M | 12 h | the argmax bootstrap under the same references |
 | `merge.sbatch` | scu-cpu | 2 cpu, 8000M | 1 h | `lcsa merge` and the gate summary |
@@ -88,3 +88,11 @@ and `merge.sbatch` rerun; the replicate seeding guarantees the same rows.
 Once the chain has run, `sacct -j <id> --format=JobID,Elapsed,MaxRSS,State`
 gives the numbers to tighten `--mem` and `--time` for the next submission.
 The limits above are ceilings rather than forecasts.
+
+## The linear-kernel robustness run
+
+`LCSA_KERNEL=linear bash slurm/pipeline.sh robustness` resubmits only the
+E3 chain against the caches the registered run built, into
+`artifacts_linear`, and `merge.sbatch` writes a manifest of SHA-256 hashes
+at the end of either run. `lcsa manifest --out $LCSA_ROOT/artifacts --check`
+proves a directory still matches the numbers the paper quotes.

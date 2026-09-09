@@ -433,8 +433,9 @@ def prepare(
     theta0 = null_fit.theta.copy()
     theta0[0] = 0.0
     meta: dict[str, dict] = {}
-    prepared = {"primary": primary.name, "theta0": theta0, "n_clusters": int(corpus.n_clusters),
-                "seed": int(seed), "readers": {}, "calibration": meta}
+    prepared = {"primary": primary.name, "kernel": kernel.name, "theta0": theta0,
+                "n_clusters": int(corpus.n_clusters), "seed": int(seed), "readers": {},
+                "calibration": meta}
 
     if want is None or "N0" in want:
         # The plain floor is i.i.d. from the fitted family at delta = 0, so one q
@@ -469,8 +470,9 @@ def save_prepared(out_dir, prepared: dict) -> None:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     arrays = {"theta0": np.asarray(prepared["theta0"], dtype=np.float64)}
-    meta = {"primary": prepared["primary"], "n_clusters": prepared["n_clusters"],
-            "seed": prepared["seed"], "calibration": prepared["calibration"], "readers": {}}
+    meta = {"primary": prepared["primary"], "kernel": prepared.get("kernel", "power"),
+            "n_clusters": prepared["n_clusters"], "seed": prepared["seed"],
+            "calibration": prepared["calibration"], "readers": {}}
     for nm, rec in prepared["readers"].items():
         m = {k: v for k, v in rec.items() if k not in ("q", "directions")}
         for key in ("q", "directions"):
@@ -496,7 +498,8 @@ def load_prepared(out_dir, corpus: Corpus) -> dict:
     cuts = np.cumsum(sizes)[:-1]
     total = int(sum(sizes))
     with np.load(out / PREPARED_NPZ, allow_pickle=False) as z:
-        prepared = {"primary": meta["primary"], "theta0": z["theta0"].astype(np.float64),
+        prepared = {"primary": meta["primary"], "kernel": meta.get("kernel", "power"),
+                    "theta0": z["theta0"].astype(np.float64),
                     "n_clusters": int(meta["n_clusters"]), "seed": int(meta["seed"]),
                     "calibration": denull(meta["calibration"]), "readers": {}}
         for nm, m in meta["readers"].items():
@@ -514,12 +517,18 @@ def load_prepared(out_dir, corpus: Corpus) -> dict:
     return prepared
 
 
-def _check_primary(prepared: dict, models) -> Model:
+def _check_primary(prepared: dict, models, kernel=None) -> Model:
     primary = models[0]
     if primary.name != prepared["primary"]:
         raise ValueError(
             f"the prepared stage used {prepared['primary']!r} as the primary estimator "
             f"but this run lists {primary.name!r} first; pass the same --estimators")
+    want = prepared.get("kernel", "power")
+    if kernel is not None and kernel.name != want:
+        raise ValueError(
+            f"the prepared stage in this directory used the {want!r} kernel but this run "
+            f"asks for {kernel.name!r}; theta0 and the floors depend on the kernel, so "
+            f"pass --kernel {want} or prepare into a different --out")
     return primary
 
 
@@ -534,7 +543,7 @@ def run_replicate_shard(
     seed: int = 0,
 ) -> list[dict]:
     """Stage two of E3: replicates ``reps`` of one reader under every estimator."""
-    primary = _check_primary(prepared, models)
+    primary = _check_primary(prepared, models, kernel)
     if reader not in prepared["readers"]:
         raise KeyError(f"reader {reader!r} was not prepared; have {list(prepared['readers'])}")
     rec = prepared["readers"][reader]
@@ -572,7 +581,7 @@ def run_human(
     It runs after the null outputs are written, because the order is the only
     thing keeping the comparison from being adjusted after the fact.
     """
-    _check_primary(prepared, models)
+    _check_primary(prepared, models, kernel)
     art = Artifacts(out_dir, "e3")
     fits = [fit_and_profile(corpus, m, kernel, seed=seed) for m in models]
     art.table("e3_human_fit", fits)
@@ -609,7 +618,7 @@ def run_contrast_shard(
     seed: int = 0,
 ) -> list[dict]:
     """Stage four of E3: paired bootstrap replicates ``reps`` of the contrast."""
-    primary = _check_primary(prepared, models)
+    primary = _check_primary(prepared, models, kernel)
     nulls = null_corpora_from(corpus, prepared, seed)
     recs = contrast_replicates(corpus, nulls, primary, kernel, reps, seed) if nulls else []
     write_shard(out_dir, "e3_contrast", reps, recs)
