@@ -8,6 +8,8 @@ weights, so the numbers are meaningless while every shape, index and join is rea
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 from test_provo_loader import PASSAGES, _eye_rows, _norms_rows
@@ -176,3 +178,56 @@ def test_an_empty_build_says_what_to_check(provo_dir, scorer):
         build_corpus(provo, scorer, load_subtlex(None),
                      BuildConfig(top_k_expansions=0),
                      select=lambda tid, wn, K: False)
+
+
+def test_frozen_candidates_reproduce_the_candidate_sets_under_another_scorer(built, provo_dir):
+    """A reference cache must have row for row the primary's candidates."""
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    from lcsa.cache import ReferenceScorer
+
+    provo, corpus, words, keys = built
+    torch.manual_seed(11)
+    cfg = GPT2Config(vocab_size=256, n_positions=256, n_embd=32, n_layer=2, n_head=2)
+    other = ReferenceScorer("test-other", device="cpu", dtype="float32",
+                            model=GPT2LMHeadModel(cfg), tokenizer=ByteTokenizer())
+    w2, k2 = [], []
+    ref = build_corpus(provo, other, load_subtlex(None),
+                       BuildConfig(max_candidates=20, max_depth=4, top_k_expansions=0),
+                       keep_words=w2, keep_keys=k2, candidates=dict(zip(keys, words)))
+    assert k2 == keys and w2 == words
+    assert [t.V for t in ref] == [t.V for t in corpus]
+    assert [t.target_slot for t in ref] == [t.target_slot for t in corpus]
+    assert all(np.allclose(a.n, b.n) for a, b in zip(ref, corpus))
+    assert not all(np.allclose(a.P, b.P) for a, b in zip(ref, corpus))
+    # Every target the frozen set lacks is skipped rather than rebuilt freely.
+    partial = build_corpus(provo, other, load_subtlex(None),
+                           BuildConfig(max_candidates=20, max_depth=4, top_k_expansions=0),
+                           candidates=dict(zip(keys[:3], words[:3])))
+    assert len(partial) == 3
+
+
+def test_e4_cli_stages_accept_a_frozen_reference_build(built, provo_dir, tmp_path):
+    from lcsa.cli import _targets_csv, main
+
+    provo, corpus, words, keys = built
+    prim, ref = tmp_path / "build", tmp_path / "ref"
+    for d in (prim, ref):
+        d.mkdir()
+        save_corpus(d / "cache.npz", corpus)
+        _targets_csv(d / "targets.csv", keys)
+    (prim / "candidates.json").write_text(json.dumps(words))
+    out = tmp_path / "art"
+    args = ["e4", "--cache", str(prim / "cache.npz"), "--out", str(out), "--provo-dir",
+            str(provo_dir), "--targets", str(prim / "targets.csv"), "--estimators", "naive",
+            "--reference", f"self={ref}", "--n-folds", "3"]
+    assert main([*args, "--stage", "sweep"]) == 0
+    assert main([*args, "--stage", "boot", "--n-boot", "3", "--boot-stop", "2"]) == 0
+    assert main([*args, "--stage", "boot", "--n-boot", "3", "--boot-start", "2"]) == 0
+    assert main(["merge", "--out", str(out), "--legs", "e4", "--estimators", "naive"]) == 0
+    res = json.loads((out / "e4_summary.json").read_text())
+    assert res["selected"]["self"] == res["selected"]["primary"]
+    assert res["argmax_bootstrap"]["self"]["n_boot"] == 3
+    _targets_csv(ref / "targets.csv", keys[1:] + keys[:1])
+    with pytest.raises(SystemExit, match="different targets"):
+        main([*args, "--stage", "sweep"])

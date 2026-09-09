@@ -11,6 +11,7 @@ keeping the comparison from being adjusted after the fact.
 
 from __future__ import annotations
 
+import json
 import logging
 
 import numpy as np
@@ -24,14 +25,18 @@ from lcsa.kernels import POWER
 from lcsa.likelihood import Model, information
 from lcsa.projection import corpus_residual_fraction
 from lcsa.readers import (calibrate_alpha, calibrate_n0_prime, draw_counts, human_js,
-                          null_distributions, reader_n0_prime)
-from lcsa.experiments import Artifacts
+                          null_distributions, reader_n0_prime, tilt_directions)
+from lcsa.experiments import Artifacts, jsonable
 from lcsa.experiments.e2_ladder import delta_se
+from lcsa.experiments.shards import denull, read_shards, write_shard
 
 log = logging.getLogger(__name__)
 
 __all__ = ["h_lexical", "within_passage_rho", "build_h_topic", "build_h_order", "build_nulls",
-           "replicate_rates", "fit_and_profile", "paired_contrast", "run"]
+           "null_replicates", "n0_prime_replicates", "summarise_rates", "replicate_rates",
+           "fit_and_profile", "contrast_replicates", "summarise_contrast", "paired_contrast",
+           "prepare", "save_prepared", "load_prepared", "run_replicate_shard", "run_human",
+           "run_contrast_shard", "assemble", "merge", "run", "FLOORS"]
 
 
 def h_lexical(corpus: Corpus, model: Model, kernel=POWER, seed: int = 0) -> list[np.ndarray]:
@@ -127,16 +132,19 @@ def build_nulls(
 
     The match is like-for-like: the null's divergence is computed from simulated
     counts at the human response counts, so the plug-in bias that makes absolute
-    JS unidentified at forty responses cancels on both sides.
+    JS unidentified at forty responses cancels on both sides.  The orthogonalised
+    unit-scale direction is returned alongside ``q_0`` so that the E4 sweep can
+    tilt every row of the cache by the same ``alpha`` without recomputing it.
     """
     js_h = human_js(corpus) if target_js is None else float(target_js)
     out = {"target_js": js_h, "nulls": {}}
     for name, h_list in h_specs.items():
+        dirs = tilt_directions(corpus, h_list, theta0, model, orthogonalise=True,
+                               kernel=kernel)
         rec = calibrate_alpha(corpus, h_list, js_h, theta0=theta0, model=model,
                               orthogonalise=True, seed=seed, kernel=kernel)
-        q = null_distributions(corpus, h_list, rec["alpha"], theta0=theta0, model=model,
-                               orthogonalise=True, kernel=kernel)
-        out["nulls"][name] = {"calibration": rec, "q": q}
+        q = null_distributions(corpus, h_list, rec["alpha"], directions=dirs)
+        out["nulls"][name] = {"calibration": rec, "q": q, "directions": dirs}
     return out
 
 
@@ -171,6 +179,131 @@ def fit_and_profile(corpus: Corpus, model: Model, kernel=POWER, seed: int = 0,
     return row
 
 
+# -- replicates ---------------------------------------------------------------
+
+#: Readers whose replicates need only ``theta0`` and the primary estimator.
+FLOORS = ("N0", "N0-PRIME")
+
+
+def _replicate_fit(corp: Corpus, model: Model, kernel, seed: int) -> dict:
+    """The score test, the fit and the naive LR on one replicate corpus."""
+    try:
+        st = score_test(corp, model, kernel, n_starts=1, seed=seed)
+        f = fit(corp, model, kernel, n_starts=2, seed=seed)
+        lr = lr_test(corp, model, kernel, full_fit=f, null_fit=st.null_fit)
+    except Exception as exc:
+        return {"failed": True, "error": str(exc)}
+    return {
+        "failed": False,
+        "p_headline": float(st.p), "p_cr1": float(st.p_cr1), "p_cr3": float(st.p_cr3),
+        "p_LR": float(lr.p), "T_cr1": float(st.T_cr1), "LR": float(lr.LR),
+        "delta_hat": float(f.delta), "design_effect": float(st.design_effect),
+        "converged": bool(f.success), "at_bound": bool(f.at_bound),
+    }
+
+
+def null_replicates(
+    corpus: Corpus,
+    q_list: list[np.ndarray],
+    models,
+    reps=range(200),
+    kernel=POWER,
+    seed: int = 0,
+    progress=None,
+) -> list[dict]:
+    """One row per (estimator, replicate): counts redrawn from ``q_list``.
+
+    Replicate ``b`` draws its counts from ``seed + b + 1`` under every estimator,
+    so the estimators see the same synthetic reader and any range of ``b`` gives
+    the same rows whether or not the other replicates were run alongside it.
+    """
+    rows = []
+    reps = list(reps)
+    for model in models:
+        for i, b in enumerate(reps):
+            rng = np.random.default_rng(seed + b + 1)
+            corp = corpus.with_counts(draw_counts(corpus, q_list, rng))
+            row = _replicate_fit(corp, model, kernel, seed)
+            if row["failed"]:
+                log.debug("replicate %d failed under %s: %s", b, model.name, row["error"])
+            rows.append({"estimator": model.name, "replicate": int(b), **row})
+            if progress is not None:
+                progress(i + 1, len(reps))
+    return rows
+
+
+def n0_prime_replicates(
+    corpus: Corpus,
+    theta0: np.ndarray,
+    primary: Model,
+    sigma: float,
+    models,
+    reps=range(200),
+    kernel=POWER,
+    seed: int = 0,
+) -> list[dict]:
+    """The over-dispersed floor, regenerated per replicate from ``seed + 5000 + b``.
+
+    It carries dependence inside a passage, so its replicates are regenerated
+    rather than resampled from one ``q``; the generator is always the primary
+    estimator's family at ``theta0``, and every estimator fits the same draw.
+    """
+    rows = []
+    for model in models:
+        for b in reps:
+            c = reader_n0_prime(corpus, theta0, primary, sigma, seed=seed + 5000 + b,
+                                kernel=kernel)
+            row = _replicate_fit(c, model, kernel, seed)
+            if row["failed"]:
+                log.debug("N0-PRIME replicate %d failed under %s: %s", b, model.name,
+                          row["error"])
+            rows.append({"estimator": model.name, "replicate": int(b), **row})
+    return rows
+
+
+def summarise_rates(rows: list[dict], alpha: float = 0.05) -> list[dict]:
+    """Rejection rates per (reader, estimator) from replicate rows, first-seen order.
+
+    A replicate that failed to fit is counted and excluded rather than quietly
+    dropped, because a null whose fits fail half the time is a finding about the
+    estimator and not a smaller sample.
+    """
+    groups: dict[tuple, list[dict]] = {}
+    for r in rows:
+        groups.setdefault((r.get("reader"), str(r["estimator"])), []).append(r)
+    out = []
+    for (reader, est), rs in groups.items():
+        ok = [r for r in rs if not r.get("failed")]
+        p_cr = [r["p_headline"] for r in ok]
+        deltas = [r["delta_hat"] for r in ok]
+        deffs = [r["design_effect"] for r in ok]
+        rate, lo, hi = rejection_rate(p_cr, alpha)
+        rate1, _, _ = rejection_rate([r["p_cr1"] for r in ok], alpha)
+        rate3, _, _ = rejection_rate([r["p_cr3"] for r in ok], alpha)
+        rate_lr, lo_lr, hi_lr = rejection_rate([r["p_LR"] for r in ok], alpha)
+        row = {
+            "estimator": est,
+            "n_replicates": int(len(rs)),
+            "n_failed": int(len(rs) - len(ok)),
+            "reject_cluster_robust": rate,
+            "reject_cr_lo": lo, "reject_cr_hi": hi,
+            "reject_cr1": rate1,
+            "reject_cr3": rate3,
+            "reject_naive_LR": rate_lr,
+            "reject_lr_lo": lo_lr, "reject_lr_hi": hi_lr,
+            "median_delta_hat": float(np.median(deltas)) if deltas else float("nan"),
+            "iqr_delta_hat": (
+                float(np.percentile(deltas, 75) - np.percentile(deltas, 25))
+                if len(deltas) > 3 else float("nan")
+            ),
+            "median_design_effect": float(np.nanmedian(deffs)) if deffs else float("nan"),
+        }
+        if reader is not None:
+            row = {"reader": reader, **row}
+        out.append(row)
+    return out
+
+
 def replicate_rates(
     corpus: Corpus,
     q_list: list[np.ndarray],
@@ -181,71 +314,23 @@ def replicate_rates(
     alpha: float = 0.05,
     progress=None,
 ) -> list[dict]:
-    """Rejection rates of ``H0: delta = 0`` over response-resampling replicates.
-
-    A replicate that fails to fit is counted and excluded rather than quietly
-    dropped, because a null whose fits fail half the time is a finding about the
-    estimator and not a smaller sample.
-    """
-    rows = []
-    for model in models:
-        p_cr, p_lr, p_cr3, deltas, deffs, fails = [], [], [], [], [], 0
-        for b in range(n_rep):
-            rng = np.random.default_rng(seed + b + 1)
-            corp = corpus.with_counts(draw_counts(corpus, q_list, rng))
-            try:
-                st = score_test(corp, model, kernel, n_starts=1, seed=seed)
-                f = fit(corp, model, kernel, n_starts=2, seed=seed)
-                lr = lr_test(corp, model, kernel, full_fit=f, null_fit=st.null_fit)
-            except Exception as exc:
-                log.debug("replicate %d failed under %s: %s", b, model.name, exc)
-                fails += 1
-                continue
-            p_cr.append(st.p)
-            p_cr3.append(st.p_cr3)
-            p_lr.append(lr.p)
-            deltas.append(f.delta)
-            deffs.append(st.design_effect)
-            if progress is not None:
-                progress(b + 1, n_rep)
-        rate, lo, hi = rejection_rate(p_cr, alpha)
-        rate_lr, lo_lr, hi_lr = rejection_rate(p_lr, alpha)
-        rate3, _, _ = rejection_rate(p_cr3, alpha)
-        rows.append({
-            "estimator": model.name,
-            "n_replicates": int(n_rep),
-            "n_failed": int(fails),
-            "reject_cluster_robust": rate,
-            "reject_cr_lo": lo, "reject_cr_hi": hi,
-            "reject_cr3": rate3,
-            "reject_naive_LR": rate_lr,
-            "reject_lr_lo": lo_lr, "reject_lr_hi": hi_lr,
-            "median_delta_hat": float(np.median(deltas)) if deltas else float("nan"),
-            "iqr_delta_hat": (
-                float(np.percentile(deltas, 75) - np.percentile(deltas, 25))
-                if len(deltas) > 3 else float("nan")
-            ),
-            "median_design_effect": float(np.nanmedian(deffs)) if deffs else float("nan"),
-        })
-    return rows
+    """Rejection rates of ``H0: delta = 0`` over ``n_rep`` response-resampling replicates."""
+    rows = null_replicates(corpus, q_list, models, range(n_rep), kernel, seed, progress)
+    return summarise_rates(rows, alpha)
 
 
-def paired_contrast(
+# -- the paired contrast ------------------------------------------------------
+
+
+def contrast_replicates(
     human: Corpus,
     null_corpora: dict[str, Corpus],
     model: Model,
     kernel=POWER,
-    n_boot: int = 200,
-    margin: float = 0.25,
+    reps=range(200),
     seed: int = 0,
-) -> dict:
-    """Paired cluster bootstrap of ``log delta_human - log delta_null``.
-
-    Both arms are refitted on the same resampled passages, which is what makes
-    the difference paired and its standard error the one the equivalence test
-    needs.  A replicate where either arm hits the boundary has an undefined log
-    difference; it is counted and excluded, never replaced by a number.
-    """
+) -> list[dict]:
+    """Human and null ``delta`` refitted on the same passage resample, per replicate."""
     names = list(null_corpora)
 
     def statistic(sub: Corpus) -> dict:
@@ -259,8 +344,16 @@ def paired_contrast(
             out[nm] = fn.delta
         return out
 
-    reps = cluster_bootstrap(human, statistic, n_boot=n_boot, seed=seed)
-    res = {"n_boot": int(n_boot), "n_usable_replicates": len(reps), "contrasts": {}}
+    return cluster_bootstrap(human, statistic, seed=seed, reps=reps)
+
+
+def summarise_contrast(reps: list[dict], names, margin: float = 0.25) -> dict:
+    """TOST on ``log delta_human - log delta_null`` from bootstrap replicate records.
+
+    A replicate where either arm hits the boundary has an undefined log
+    difference; it is counted and excluded, never replaced by a number.
+    """
+    res = {"n_boot": int(len(reps)), "n_usable_replicates": len(reps), "contrasts": {}}
     hs = np.array([r.get("human", np.nan) for r in reps], dtype=np.float64)
     for nm in names:
         ns = np.array([r.get(nm, np.nan) for r in reps], dtype=np.float64)
@@ -288,6 +381,308 @@ def paired_contrast(
     return res
 
 
+def paired_contrast(
+    human: Corpus,
+    null_corpora: dict[str, Corpus],
+    model: Model,
+    kernel=POWER,
+    n_boot: int = 200,
+    margin: float = 0.25,
+    seed: int = 0,
+) -> dict:
+    """Paired cluster bootstrap of ``log delta_human - log delta_null``.
+
+    Both arms are refitted on the same resampled passages, which is what makes
+    the difference paired and its standard error the one the equivalence test
+    needs.
+    """
+    reps = contrast_replicates(human, null_corpora, model, kernel, range(n_boot), seed)
+    return summarise_contrast(reps, list(null_corpora), margin)
+
+
+# -- stages -------------------------------------------------------------------
+
+PREPARED_JSON = "e3_prepared.json"
+PREPARED_NPZ = "e3_prepared.npz"
+
+
+def prepare(
+    corpus: Corpus,
+    models,
+    out_dir,
+    h_specs: dict[str, list[np.ndarray]] | None = None,
+    kernel=POWER,
+    seed: int = 0,
+    readers=None,
+) -> dict:
+    """Stage one of E3: everything a replicate needs, computed once and saved.
+
+    The constrained fit, the floor's tilt scale and the substantive nulls'
+    ``alpha`` are fitted here and never again, so every replicate shard starts
+    from the same ``q_0`` and no shard can drift from another.  ``readers``
+    restricts the set, which is how the GPT-2-small self-reference run asks for
+    the plain floor alone.
+    """
+    from lcsa.likelihood import evaluate_target
+
+    art = Artifacts(out_dir, "e3")
+    primary = models[0]
+    want = None if readers is None else set(readers)
+
+    null_fit = fit_constrained(corpus, primary, kernel, n_starts=3, seed=seed)
+    theta0 = null_fit.theta.copy()
+    theta0[0] = 0.0
+    meta: dict[str, dict] = {}
+    prepared = {"primary": primary.name, "theta0": theta0, "n_clusters": int(corpus.n_clusters),
+                "seed": int(seed), "readers": {}, "calibration": meta}
+
+    if want is None or "N0" in want:
+        # The plain floor is i.i.d. from the fitted family at delta = 0, so one q
+        # per target is all a replicate needs; the over-dispersed floor cannot be
+        # written this way, which is exactly the difference it exists to carry.
+        prepared["readers"]["N0"] = {
+            "q": [evaluate_target(t, theta0, primary, corpus.M, kernel).q for t in corpus]}
+    if want is None or "N0-PRIME" in want:
+        st_h = score_test(corpus, primary, kernel, n_starts=2, seed=seed)
+        cal = calibrate_n0_prime(corpus, theta0, primary,
+                                 target_design_effect=st_h.design_effect,
+                                 seed=seed, kernel=kernel)
+        meta["N0-PRIME"] = cal
+        prepared["readers"]["N0-PRIME"] = {"sigma": float(cal["sigma"])}
+    specs = {k: v for k, v in (h_specs or {}).items() if want is None or k in want}
+    if specs:
+        built = build_nulls(corpus, theta0, primary, specs, kernel=kernel, seed=seed)
+        meta["substantive"] = {k: v["calibration"] for k, v in built["nulls"].items()}
+        meta["target_js"] = built["target_js"]
+        for nm, rec in built["nulls"].items():
+            prepared["readers"][nm] = {"q": rec["q"], "directions": rec["directions"],
+                                       "alpha": float(rec["calibration"]["alpha"])}
+    save_prepared(out_dir, prepared)
+    art.save("e3_calibration", meta)
+    return prepared
+
+
+def save_prepared(out_dir, prepared: dict) -> None:
+    """Numbers to a flat ``.npz``, names and calibration records to JSON."""
+    from pathlib import Path
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    arrays = {"theta0": np.asarray(prepared["theta0"], dtype=np.float64)}
+    meta = {"primary": prepared["primary"], "n_clusters": prepared["n_clusters"],
+            "seed": prepared["seed"], "calibration": prepared["calibration"], "readers": {}}
+    for nm, rec in prepared["readers"].items():
+        m = {k: v for k, v in rec.items() if k not in ("q", "directions")}
+        for key in ("q", "directions"):
+            if key in rec:
+                arrays[f"{key}__{nm}"] = np.concatenate(
+                    [np.asarray(x, dtype=np.float64) for x in rec[key]])
+                m[key] = True
+        meta["readers"][nm] = m
+    np.savez_compressed(out / PREPARED_NPZ, **arrays)
+    (out / PREPARED_JSON).write_text(json.dumps(jsonable(meta), indent=2))
+
+
+def load_prepared(out_dir, corpus: Corpus) -> dict:
+    """Inverse of :func:`save_prepared`; splits the flat arrays by the corpus's ``V``."""
+    from pathlib import Path
+
+    out = Path(out_dir)
+    if not (out / PREPARED_JSON).exists():
+        raise FileNotFoundError(
+            f"{out / PREPARED_JSON} is missing; run `lcsa e3 --stage prepare` first")
+    meta = json.loads((out / PREPARED_JSON).read_text())
+    sizes = [t.V for t in corpus]
+    cuts = np.cumsum(sizes)[:-1]
+    total = int(sum(sizes))
+    with np.load(out / PREPARED_NPZ, allow_pickle=False) as z:
+        prepared = {"primary": meta["primary"], "theta0": z["theta0"].astype(np.float64),
+                    "n_clusters": int(meta["n_clusters"]), "seed": int(meta["seed"]),
+                    "calibration": denull(meta["calibration"]), "readers": {}}
+        for nm, m in meta["readers"].items():
+            rec = {k: v for k, v in m.items() if k not in ("q", "directions")}
+            for key in ("q", "directions"):
+                if m.get(key):
+                    flat = z[f"{key}__{nm}"]
+                    if flat.size != total:
+                        raise ValueError(
+                            f"{out / PREPARED_NPZ} holds {flat.size} entries for {nm} but "
+                            f"the cache has {total} candidates; the prepared file and the "
+                            "cache come from different builds")
+                    rec[key] = [np.ascontiguousarray(a) for a in np.split(flat, cuts)]
+            prepared["readers"][nm] = rec
+    return prepared
+
+
+def _check_primary(prepared: dict, models) -> Model:
+    primary = models[0]
+    if primary.name != prepared["primary"]:
+        raise ValueError(
+            f"the prepared stage used {prepared['primary']!r} as the primary estimator "
+            f"but this run lists {primary.name!r} first; pass the same --estimators")
+    return primary
+
+
+def run_replicate_shard(
+    corpus: Corpus,
+    prepared: dict,
+    models,
+    out_dir,
+    reader: str,
+    reps: range,
+    kernel=POWER,
+    seed: int = 0,
+) -> list[dict]:
+    """Stage two of E3: replicates ``reps`` of one reader under every estimator."""
+    primary = _check_primary(prepared, models)
+    if reader not in prepared["readers"]:
+        raise KeyError(f"reader {reader!r} was not prepared; have {list(prepared['readers'])}")
+    rec = prepared["readers"][reader]
+    if reader == "N0-PRIME":
+        rows = n0_prime_replicates(corpus, prepared["theta0"], primary, rec["sigma"], models,
+                                   reps, kernel=kernel, seed=seed)
+    else:
+        rows = null_replicates(corpus, rec["q"], models, reps, kernel=kernel, seed=seed)
+    rows = [{"reader": reader, **r} for r in rows]
+    write_shard(out_dir, f"e3_rates_{reader}", reps, rows)
+    return rows
+
+
+def null_corpora_from(corpus: Corpus, prepared: dict, seed: int) -> dict[str, Corpus]:
+    """One drawn corpus per substantive null, the arm the paired contrast refits."""
+    out = {}
+    for nm, rec in prepared["readers"].items():
+        if nm in FLOORS:
+            continue
+        rng = np.random.default_rng(seed + 99)
+        out[nm] = corpus.with_counts(draw_counts(corpus, rec["q"], rng))
+    return out
+
+
+def run_human(
+    corpus: Corpus,
+    prepared: dict,
+    models,
+    out_dir,
+    kernel=POWER,
+    seed: int = 0,
+) -> dict:
+    """Stage three of E3: the human fits, residual fractions and precision inputs.
+
+    It runs after the null outputs are written, because the order is the only
+    thing keeping the comparison from being adjusted after the fact.
+    """
+    _check_primary(prepared, models)
+    art = Artifacts(out_dir, "e3")
+    fits = [fit_and_profile(corpus, m, kernel, seed=seed) for m in models]
+    art.table("e3_human_fit", fits)
+    # The residual fraction is evaluated at each estimator's own constrained
+    # null, since the span it projects against is that estimator's span.
+    resid = []
+    for m in models:
+        nm = fit_constrained(corpus, m, kernel, n_starts=2, seed=seed)
+        rep = corpus_residual_fraction(corpus, nm.theta, m, kernel)
+        resid.append({
+            "estimator": m.name,
+            "residual_fraction": rep.fraction,
+            "residual_fraction_unweighted": rep.fraction_unweighted,
+            "span_dim_mean": rep.span_dim_mean,
+            "n_targets": rep.n_targets_used,
+        })
+    art.table("e3_human_residual", resid)
+    precision = {
+        "sd_passage_log_delta": passage_sd_log_delta(corpus, models[0], kernel, seed),
+        "within_passage_rho": within_passage_rho(corpus, prepared["theta0"], models[0], kernel),
+    }
+    human = {"fits": fits, "residual_fraction": resid, "precision": precision}
+    art.save("e3_human_stage", human)
+    return human
+
+
+def run_contrast_shard(
+    corpus: Corpus,
+    prepared: dict,
+    models,
+    out_dir,
+    reps: range,
+    kernel=POWER,
+    seed: int = 0,
+) -> list[dict]:
+    """Stage four of E3: paired bootstrap replicates ``reps`` of the contrast."""
+    primary = _check_primary(prepared, models)
+    nulls = null_corpora_from(corpus, prepared, seed)
+    recs = contrast_replicates(corpus, nulls, primary, kernel, reps, seed) if nulls else []
+    write_shard(out_dir, "e3_contrast", reps, recs)
+    return recs
+
+
+def assemble(
+    prepared: dict,
+    rate_rows: list[dict],
+    out_dir,
+    human: dict | None = None,
+    contrast_reps: list[dict] | None = None,
+    margin: float = 0.25,
+    alpha: float = 0.05,
+) -> dict:
+    """Stage five of E3: the registered tables, gate G5, then G4 from the contrast."""
+    art = Artifacts(out_dir, "e3")
+    rows = summarise_rates(rate_rows, alpha)
+    art.table("e3_rejection_rates", rows)
+    floors = {
+        f"{r['reader']}/{r['estimator']}": r["reject_cluster_robust"]
+        for r in rows if r["reader"] in FLOORS
+    }
+    res = {"rejection_rates": rows, "calibration": prepared["calibration"],
+           "g5": g5_floors(floors), "human": None}
+    art.save("e3_nulls", res)
+    if human is not None:
+        names = [nm for nm in prepared["readers"] if nm not in FLOORS]
+        contrast = (summarise_contrast(contrast_reps, names, margin)
+                    if contrast_reps and names else None)
+        r_pair = float("nan")
+        if contrast and contrast.get("contrasts"):
+            vals = [v["pairing_correlation"] for v in contrast["contrasts"].values()]
+            vals = [v for v in vals if np.isfinite(v)]
+            r_pair = float(np.mean(vals)) if vals else float("nan")
+        prec = human["precision"]
+        res["human"] = {
+            "fits": human["fits"],
+            "residual_fraction": human["residual_fraction"],
+            "contrast": contrast,
+            "g4": g4_precision(prec["sd_passage_log_delta"], r_pair,
+                               prec["within_passage_rho"],
+                               n_clusters=int(prepared["n_clusters"])),
+        }
+        art.save("e3_human", res["human"])
+    art.save("e3_summary", res)
+    return res
+
+
+def merge(out_dir, margin: float = 0.25, alpha: float = 0.05) -> dict:
+    """Combine the prepared stage, the rate shards and the human stage on disk."""
+    from pathlib import Path
+
+    out = Path(out_dir)
+    if not (out / PREPARED_JSON).exists():
+        raise FileNotFoundError(
+            f"{out / PREPARED_JSON} is missing; run `lcsa e3 --stage prepare` first")
+    meta = json.loads((out / PREPARED_JSON).read_text())
+    prepared = {"primary": meta["primary"], "n_clusters": int(meta["n_clusters"]),
+                "calibration": denull(meta["calibration"]), "readers": meta["readers"]}
+    rate_rows = []
+    for nm in meta["readers"]:
+        rate_rows += read_shards(out, f"e3_rates_{nm}")
+    human = contrast = None
+    if (out / "e3_human_stage.json").exists():
+        human = denull(json.loads((out / "e3_human_stage.json").read_text()))
+        try:
+            contrast = read_shards(out, "e3_contrast")
+        except FileNotFoundError:
+            contrast = None
+    return assemble(prepared, rate_rows, out, human, contrast, margin, alpha)
+
+
 def run(
     corpus: Corpus,
     models,
@@ -298,113 +693,21 @@ def run(
     n_boot: int = 200,
     seed: int = 0,
     fit_human: bool = True,
+    readers=None,
 ) -> dict:
-    """Full E3 leg: floors, substantive nulls, gate G5, then the human fit."""
-    art = Artifacts(out_dir, "e3")
-    primary = models[0]
-    null_fit = fit_constrained(corpus, primary, kernel, n_starts=3, seed=seed)
-    theta0 = null_fit.theta.copy()
-    theta0[0] = 0.0
-
-    meta: dict[str, dict] = {}
-
-    from lcsa.likelihood import evaluate_target
-
-    # The plain floor is i.i.d. from the fitted family at delta = 0, so one q per
-    # target is all a replicate needs; the over-dispersed floor below cannot be
-    # written this way, which is exactly the difference it exists to carry.
-    q0 = [evaluate_target(t, theta0, primary, corpus.M, kernel).q for t in corpus]
-
-    st_h = score_test(corpus, primary, kernel, n_starts=2, seed=seed)
-    cal = calibrate_n0_prime(corpus, theta0, primary, target_design_effect=st_h.design_effect,
-                             seed=seed, kernel=kernel)
-    meta["N0-PRIME"] = cal
+    """Full E3 leg in one process: floors, substantive nulls, G5, then the human fit."""
+    prepared = prepare(corpus, models, out_dir, h_specs, kernel=kernel, seed=seed,
+                       readers=readers)
     rows = []
-    rows += [dict(r, reader="N0") for r in
-             replicate_rates(corpus, q0, models, n_rep=n_rep, kernel=kernel, seed=seed)]
-    # The over-dispersed floor carries dependence inside a passage, so its
-    # replicates are regenerated rather than resampled from one q.
-    p_rows = []
-    for model in models:
-        p_cr, p_lr, deltas = [], [], []
-        for b in range(n_rep):
-            c = reader_n0_prime(corpus, theta0, primary, cal["sigma"],
-                                seed=seed + 5000 + b, kernel=kernel)
-            try:
-                st = score_test(c, model, kernel, n_starts=1, seed=seed)
-                f = fit(c, model, kernel, n_starts=2, seed=seed)
-                lr = lr_test(c, model, kernel, full_fit=f, null_fit=st.null_fit)
-            except Exception as exc:
-                log.debug("N0-PRIME replicate %d failed: %s", b, exc)
-                continue
-            p_cr.append(st.p)
-            p_lr.append(lr.p)
-            deltas.append(f.delta)
-        rate, lo, hi = rejection_rate(p_cr)
-        rate_lr, lo_lr, hi_lr = rejection_rate(p_lr)
-        p_rows.append({
-            "reader": "N0-PRIME", "estimator": model.name,
-            "n_replicates": int(n_rep), "n_failed": int(n_rep - len(p_cr)),
-            "reject_cluster_robust": rate, "reject_cr_lo": lo, "reject_cr_hi": hi,
-            "reject_naive_LR": rate_lr, "reject_lr_lo": lo_lr, "reject_lr_hi": hi_lr,
-            "median_delta_hat": float(np.median(deltas)) if deltas else float("nan"),
-        })
-    rows += p_rows
-
-    null_corpora: dict[str, Corpus] = {}
-    if h_specs:
-        built = build_nulls(corpus, theta0, primary, h_specs, kernel=kernel, seed=seed)
-        meta["substantive"] = {k: v["calibration"] for k, v in built["nulls"].items()}
-        meta["target_js"] = built["target_js"]
-        for nm, rec in built["nulls"].items():
-            rows += [dict(r, reader=nm) for r in
-                     replicate_rates(corpus, rec["q"], models, n_rep=n_rep,
-                                     kernel=kernel, seed=seed)]
-            rng = np.random.default_rng(seed + 99)
-            null_corpora[nm] = corpus.with_counts(draw_counts(corpus, rec["q"], rng))
-
-    art.table("e3_rejection_rates", rows)
-
-    floors = {
-        f"{r['reader']}/{r['estimator']}": r["reject_cluster_robust"]
-        for r in rows if r["reader"] in ("N0", "N0-PRIME")
-    }
-    res = {"rejection_rates": rows, "calibration": meta,
-           "g5": g5_floors(floors), "human": None}
-    art.save("e3_nulls", res)
-
+    for nm in prepared["readers"]:
+        rows += run_replicate_shard(corpus, prepared, models, out_dir, nm, range(n_rep),
+                                    kernel=kernel, seed=seed)
+    human = contrast = None
     if fit_human:
-        human_rows = [fit_and_profile(corpus, m, kernel, seed=seed) for m in models]
-        art.table("e3_human_fit", human_rows)
-        # The residual fraction is evaluated at each estimator's own constrained
-        # null, since the span it projects against is that estimator's span.
-        resid = []
-        for m in models:
-            nm = fit_constrained(corpus, m, kernel, n_starts=2, seed=seed)
-            rep = corpus_residual_fraction(corpus, nm.theta, m, kernel)
-            resid.append({
-                "estimator": m.name,
-                "residual_fraction": rep.fraction,
-                "residual_fraction_unweighted": rep.fraction_unweighted,
-                "span_dim_mean": rep.span_dim_mean,
-                "n_targets": rep.n_targets_used,
-            })
-        art.table("e3_human_residual", resid)
-        contrast = (
-            paired_contrast(corpus, null_corpora, primary, kernel, n_boot=n_boot, seed=seed)
-            if null_corpora else None
-        )
-        sd_pass, r_pair, rho = _precision_inputs(corpus, primary, kernel, contrast, seed,
-                                                 theta0=theta0)
-        res["human"] = {
-            "fits": human_rows,
-            "residual_fraction": resid,
-            "contrast": contrast,
-            "g4": g4_precision(sd_pass, r_pair, rho, n_clusters=corpus.n_clusters),
-        }
-        art.save("e3_human", res["human"])
-    art.save("e3_summary", res)
-    return res
+        human = run_human(corpus, prepared, models, out_dir, kernel=kernel, seed=seed)
+        contrast = run_contrast_shard(corpus, prepared, models, out_dir, range(n_boot),
+                                      kernel=kernel, seed=seed)
+    return assemble(prepared, rows, out_dir, human, contrast)
 
 
 def within_passage_rho(corpus: Corpus, theta0: np.ndarray, model: Model,
@@ -442,9 +745,8 @@ def within_passage_rho(corpus: Corpus, theta0: np.ndarray, model: Model,
     return float((msb - msw) / den) if den > 0 else float("nan")
 
 
-def _precision_inputs(corpus: Corpus, model: Model, kernel, contrast, seed: int,
-                      theta0: np.ndarray | None = None):
-    """Passage-level SD of ``log delta``, the pairing correlation and within-passage rho."""
+def passage_sd_log_delta(corpus: Corpus, model: Model, kernel, seed: int) -> float:
+    """Passage-level SD of ``log delta`` from one fit per passage, the input to G4."""
     logs = []
     for c in np.unique(corpus.cluster_index):
         try:
@@ -453,13 +755,4 @@ def _precision_inputs(corpus: Corpus, model: Model, kernel, contrast, seed: int,
             continue
         if f.delta > 0 and np.isfinite(f.delta):
             logs.append(np.log(f.delta))
-    sd = float(np.std(logs, ddof=1)) if len(logs) > 2 else float("nan")
-    r_pair = float("nan")
-    if contrast and contrast.get("contrasts"):
-        vals = [v["pairing_correlation"] for v in contrast["contrasts"].values()]
-        vals = [v for v in vals if np.isfinite(v)]
-        r_pair = float(np.mean(vals)) if vals else float("nan")
-    if theta0 is None:
-        theta0 = fit_constrained(corpus, model, kernel, n_starts=2, seed=seed).theta
-    rho = within_passage_rho(corpus, theta0, model, kernel)
-    return sd, r_pair, rho
+    return float(np.std(logs, ddof=1)) if len(logs) > 2 else float("nan")

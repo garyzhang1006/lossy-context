@@ -98,10 +98,28 @@ def cmd_build(args) -> int:
         if n % 50 == 0:
             log.info("built %d targets (%.1f s)", n, time.time() - t0)
 
+    frozen = None
+    if args.candidates or args.targets:
+        if not (args.candidates and args.targets):
+            raise SystemExit("--candidates and --targets go together; both come from the "
+                             "primary build directory")
+        frozen_keys = _read_keys(Path(args.targets))
+        frozen_words = json.loads(Path(args.candidates).read_text())
+        if len(frozen_keys) != len(frozen_words):
+            raise SystemExit(f"{args.targets} has {len(frozen_keys)} rows but "
+                             f"{args.candidates} has {len(frozen_words)} lists")
+        frozen = dict(zip(frozen_keys, frozen_words))
+        log.info("candidate sets frozen to the %d targets of %s", len(frozen), args.targets)
     corpus = build_corpus(provo, scorer, unigrams, cfg, limit=args.limit,
-                          progress=progress, keep_words=words, keep_keys=keys)
+                          progress=progress, keep_words=words, keep_keys=keys,
+                          candidates=frozen)
     dt = time.time() - t0
     log.info("built %d targets in %.1f s", len(corpus), dt)
+    if frozen is not None and args.limit is None and keys != frozen_keys:
+        raise SystemExit(
+            f"the frozen build produced {len(keys)} targets in a different order from "
+            f"the {len(frozen_keys)} of {args.targets}; the Provo files differ from the "
+            "primary build's and this cache cannot serve as its reference")
 
     save_corpus(out / "cache.npz", corpus)
     _targets_csv(out / "targets.csv", keys)
@@ -150,27 +168,73 @@ def cmd_e1(args) -> int:
     return 0
 
 
+def _rep_range(args, n_default, start_attr="rep_start", stop_attr="rep_stop") -> range:
+    """Replicates for this process: the whole run unless a shard range was given."""
+    from lcsa.experiments.shards import rep_indices
+
+    start, stop = getattr(args, start_attr), getattr(args, stop_attr)
+    if start is None and stop is None:
+        return rep_indices(n_default)
+    return rep_indices(n_default, (start or 0, stop if stop is not None else n_default))
+
+
+def _print(obj) -> None:
+    print(json.dumps(obj, indent=2, default=str))
+
+
 def cmd_e2(args) -> int:
-    from lcsa.experiments.e2_ladder import run
+    from lcsa.experiments import e2_ladder as e2
     from lcsa.fitting import fit_constrained
+    from lcsa.store import load_corpus
 
     corpus = _load(args)
     models = _models(args.estimators)
-    theta0 = fit_constrained(corpus, models[0], n_starts=3, seed=args.seed).theta
-    res = run(corpus, corpus, theta0, models, args.out, n_rep=args.n_rep, seed=args.seed)
-    print(json.dumps({"g6_passed": res["g6"].passed,
-                      "coverage": res["g6"].measured,
-                      "ceiling": res["ceiling"]}, indent=2, default=str))
+    gen = corpus
+    if args.gen_cache:
+        gp = Path(args.gen_cache)
+        if not gp.exists():
+            raise SystemExit(f"generating cache not found: {gp}")
+        gen = load_corpus(gp)
+        if len(gen) != len(corpus):
+            raise SystemExit(f"{gp} has {len(gen)} targets but {args.cache} has "
+                             f"{len(corpus)}; the ladder needs the same targets.csv")
+    theta_path = Path(args.out) / "e2_theta0.json"
+    if args.stage in ("all", "ladder"):
+        # The nuisance vector comes from the human counts under the primary
+        # estimator and is written once, so every coverage shard reads the same
+        # numbers instead of refitting them on a node with a different BLAS.
+        theta0 = fit_constrained(corpus, models[0], n_starts=3, seed=args.seed).theta
+        theta_path.parent.mkdir(parents=True, exist_ok=True)
+        theta_path.write_text(json.dumps({"theta0": [float(x) for x in theta0],
+                                          "estimator": models[0].name,
+                                          "gen_cache": args.gen_cache}))
+    else:
+        if not theta_path.exists():
+            raise SystemExit(f"{theta_path} is missing; run `lcsa e2 --stage ladder` first")
+        theta0 = np.asarray(json.loads(theta_path.read_text())["theta0"], dtype=np.float64)
+    if args.stage == "all":
+        res = e2.run(gen, corpus, theta0, models, args.out, n_rep=args.n_rep, seed=args.seed)
+    elif args.stage == "ladder":
+        e2.run_ladder(gen, corpus, theta0, models, args.out, seed=args.seed)
+        _print({"stage": "ladder", "out": args.out})
+        return 0
+    else:
+        reps = _rep_range(args, args.n_rep)
+        rows = e2.run_coverage_shard(gen, corpus, theta0, models, args.out, reps,
+                                     seed=args.seed)
+        _print({"stage": "coverage", "replicates": [reps.start, reps.stop],
+                "rows": len(rows), "failed": sum(1 for r in rows if r.get("failed"))})
+        return 0
+    _print({"g6_passed": res["g6"].passed, "coverage": res["g6"].measured,
+            "ceiling": res["ceiling"]})
     return 0
 
 
-def cmd_e3(args) -> int:
-    from lcsa.experiments.e3_nulls import (build_h_order, build_h_topic, h_lexical,
-                                           run)
+def _e3_h_specs(args, corpus) -> dict:
+    from lcsa.experiments.e3_nulls import build_h_order, build_h_topic, h_lexical
 
-    corpus = _load(args)
-    models = _models(args.estimators)
     wanted = [x.strip().lower() for x in args.nulls.split(",") if x.strip()]
+    wanted = [w for w in wanted if w != "none"]
     h_specs = {}
     if "lex" in wanted:
         from lcsa.likelihood import REPAIRED
@@ -196,20 +260,85 @@ def cmd_e3(args) -> int:
         if "order" in wanted:
             h_specs["N-ORDER"] = build_h_order(corpus, words, contexts, scorer,
                                                seed=args.seed)
-    res = run(corpus, models, args.out, h_specs=h_specs or None, n_rep=args.n_rep,
-              n_boot=args.n_boot, seed=args.seed, fit_human=not args.no_human)
-    print(json.dumps({"g5_passed": res["g5"].passed,
-                      "rates": [{k: r[k] for k in
-                                 ("reader", "estimator", "reject_cluster_robust",
-                                  "reject_naive_LR")} for r in res["rejection_rates"]]},
-                     indent=2, default=str))
+    return h_specs
+
+
+def cmd_e3(args) -> int:
+    from lcsa.experiments import e3_nulls as e3
+
+    corpus = _load(args)
+    models = _models(args.estimators)
+    readers = ([x.strip() for x in args.readers.split(",") if x.strip()]
+               if args.readers else None)
+    if args.stage == "all":
+        res = e3.run(corpus, models, args.out, h_specs=_e3_h_specs(args, corpus) or None,
+                     n_rep=args.n_rep, n_boot=args.n_boot, seed=args.seed,
+                     fit_human=not args.no_human, readers=readers)
+        _print({"g5_passed": res["g5"].passed,
+                "rates": [{k: r[k] for k in ("reader", "estimator", "reject_cluster_robust",
+                                             "reject_naive_LR")}
+                          for r in res["rejection_rates"]]})
+        return 0
+    if args.stage == "prepare":
+        prep = e3.prepare(corpus, models, args.out, _e3_h_specs(args, corpus) or None,
+                          seed=args.seed, readers=readers)
+        _print({"stage": "prepare", "readers": list(prep["readers"]),
+                "calibration": prep["calibration"]})
+        return 0
+    prep = e3.load_prepared(args.out, corpus)
+    if args.stage == "replicates":
+        reps = _rep_range(args, args.n_rep)
+        out = {}
+        for nm in readers or list(prep["readers"]):
+            rows = e3.run_replicate_shard(corpus, prep, models, args.out, nm, reps,
+                                          seed=args.seed)
+            out[nm] = {"rows": len(rows), "failed": sum(1 for r in rows if r["failed"])}
+        _print({"stage": "replicates", "replicates": [reps.start, reps.stop], "readers": out})
+    elif args.stage == "human":
+        human = e3.run_human(corpus, prep, models, args.out, seed=args.seed)
+        _print({"stage": "human", "fits": [{k: f[k] for k in ("estimator", "delta_hat",
+                                                              "p_headline")}
+                                           for f in human["fits"]]})
+    else:
+        reps = _rep_range(args, args.n_boot, "boot_start", "boot_stop")
+        recs = e3.run_contrast_shard(corpus, prep, models, args.out, reps, seed=args.seed)
+        _print({"stage": "contrast", "replicates": [reps.start, reps.stop], "rows": len(recs)})
     return 0
+
+
+def _e4_references(args, corpus, keys) -> dict | None:
+    """The zero-decay references for the sweep, keyed by name, primary first."""
+    from lcsa.store import load_corpus
+
+    refs = {"primary": None}
+    for spec in args.reference or []:
+        if "=" not in spec:
+            raise SystemExit(f"--reference takes NAME=DIR, got {spec!r}")
+        name, d = spec.split("=", 1)
+        d = Path(d)
+        if not (d / "cache.npz").exists() or not (d / "targets.csv").exists():
+            raise SystemExit(f"reference {name}: {d} needs cache.npz and targets.csv")
+        if _read_keys(d / "targets.csv") != keys:
+            raise SystemExit(f"reference {name}: {d / 'targets.csv'} lists different "
+                             f"targets from {args.targets}; rebuild it with --candidates "
+                             "and --targets from the primary build")
+        refs[name] = load_corpus(d / "cache.npz")
+    if args.tilted_from:
+        from lcsa.experiments.e3_nulls import FLOORS, load_prepared
+        from lcsa.readers import tilted_cache
+
+        prep = load_prepared(args.tilted_from, corpus)
+        for nm, rec in prep["readers"].items():
+            if nm in FLOORS or "directions" not in rec:
+                continue
+            refs[nm] = tilted_cache(corpus, rec["directions"], rec["alpha"])
+    return refs if len(refs) > 1 else None
 
 
 def cmd_e4(args) -> int:
     from lcsa.data.provo import load_provo
     from lcsa.data.subtlex import load_subtlex
-    from lcsa.experiments.e4_reading import gaze_table, run
+    from lcsa.experiments import e4_reading as e4
     from lcsa.fitting import fit
 
     corpus = _load(args)
@@ -222,13 +351,54 @@ def cmd_e4(args) -> int:
             "targets; they must come from the same build"
         )
     unigrams = load_subtlex(args.subtlex)
-    y, ctrl, passage = gaze_table(provo, keys, unigrams)
-    f = fit(corpus, models[0], n_starts=3, seed=args.seed)
-    res = run(corpus, y, ctrl, passage, models, args.out,
-              fitted={"human": (f.theta, models[0])}, n_boot=args.n_boot,
-              n_folds=args.n_folds, seed=args.seed)
-    print(json.dumps({"selected_k": res["selected"],
-                      "prediction_8": res["prediction_8"]}, indent=2, default=str))
+    y, ctrl, passage = e4.gaze_table(provo, keys, unigrams)
+    refs = _e4_references(args, corpus, keys)
+    if args.stage in ("all", "sweep"):
+        f = fit(corpus, models[0], n_starts=3, seed=args.seed)
+        fitted = {"human": (f.theta, models[0])}
+    if args.stage == "all":
+        res = e4.run(corpus, y, ctrl, passage, models, args.out, references=refs,
+                     fitted=fitted, n_boot=args.n_boot, n_folds=args.n_folds,
+                     seed=args.seed)
+        _print({"selected_k": res["selected"], "prediction_8": res["prediction_8"]})
+    elif args.stage == "sweep":
+        stage = e4.run_sweep(corpus, y, ctrl, passage, models, args.out, references=refs,
+                             fitted=fitted, n_folds=args.n_folds, seed=args.seed)
+        _print({"stage": "sweep", "selected_k": {n: s["argmax_k"]
+                                                 for n, s in stage["sweeps"].items()}})
+    else:
+        reps = _rep_range(args, args.n_boot, "boot_start", "boot_stop")
+        rows = e4.run_argmax_shard(corpus, y, ctrl, passage, args.out, reps,
+                                   references=refs, seed=args.seed)
+        _print({"stage": "boot", "replicates": [reps.start, reps.stop], "rows": len(rows)})
+    return 0
+
+
+def cmd_merge(args) -> int:
+    """Combine the stage outputs and shards of each leg into the registered tables."""
+    legs = [x.strip().lower() for x in args.legs.split(",") if x.strip()]
+    models = _models(args.estimators)
+    out = {}
+    for leg in legs:
+        if leg == "e2":
+            from lcsa.experiments.e2_ladder import merge
+
+            res = merge(args.out, models)
+            out["e2"] = {"g6_passed": res["g6"].passed, "coverage": res["g6"].measured}
+        elif leg == "e3":
+            from lcsa.experiments.e3_nulls import merge
+
+            res = merge(args.out, margin=args.margin)
+            out["e3"] = {"g5_passed": res["g5"].passed,
+                         "human": None if res["human"] is None else res["human"]["g4"]}
+        elif leg == "e4":
+            from lcsa.experiments.e4_reading import merge
+
+            res = merge(args.out)
+            out["e4"] = {"selected_k": res["selected"], "prediction_8": res["prediction_8"]}
+        else:
+            raise SystemExit(f"unknown leg {leg!r}; choose from e2, e3, e4")
+    _print(out)
     return 0
 
 
@@ -323,6 +493,10 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--top-k", type=int, default=50)
     b.add_argument("--no-eye", action="store_true", help="skip the eye-tracking arm")
     b.add_argument("--force", action="store_true", help="build even if G0 fails")
+    b.add_argument("--candidates", default=None,
+                   help="candidates.json of the primary build: freeze its candidate sets")
+    b.add_argument("--targets", default=None,
+                   help="targets.csv of the primary build, paired with --candidates")
     b.set_defaults(func=cmd_build)
 
     def common(sp):
@@ -335,22 +509,39 @@ def build_parser() -> argparse.ArgumentParser:
     common(e1)
     e1.set_defaults(func=cmd_e1)
 
+    def shard(sp, prefix, what):
+        sp.add_argument(f"--{prefix}-start", type=int, default=None,
+                        help=f"first {what} of this shard (inclusive)")
+        sp.add_argument(f"--{prefix}-stop", type=int, default=None,
+                        help=f"one past the last {what} of this shard")
+
     e2 = sub.add_parser("e2", help="recovery ladder, coverage, identification ceiling")
     common(e2)
     e2.add_argument("--n-rep", type=int, default=200)
+    e2.add_argument("--stage", choices=["all", "ladder", "coverage"], default="all")
+    e2.add_argument("--gen-cache", default=None,
+                    help="cache.npz of another checkpoint to generate the ladder under")
+    shard(e2, "rep", "coverage replicate")
     e2.set_defaults(func=cmd_e2)
 
     e3 = sub.add_parser("e3", help="zero-decay nulls, then the human fit")
     common(e3)
     e3.add_argument("--n-rep", type=int, default=200)
     e3.add_argument("--n-boot", type=int, default=200)
-    e3.add_argument("--nulls", default="lex", help="comma list of lex,topic,order")
+    e3.add_argument("--nulls", default="lex",
+                    help="comma list of lex,topic,order; none for the floors alone")
     e3.add_argument("--provo-dir", default=None)
     e3.add_argument("--targets", default="artifacts/build/targets.csv")
     e3.add_argument("--candidates", default="artifacts/build/candidates.json")
     e3.add_argument("--model", default="Qwen/Qwen2.5-1.5B")
     e3.add_argument("--dtype", default="float16")
     e3.add_argument("--no-human", action="store_true")
+    e3.add_argument("--stage", choices=["all", "prepare", "replicates", "human", "contrast"],
+                    default="all")
+    e3.add_argument("--readers", default=None,
+                    help="comma list of readers to prepare or replicate, default all")
+    shard(e3, "rep", "null replicate")
+    shard(e3, "boot", "contrast bootstrap replicate")
     e3.set_defaults(func=cmd_e3)
 
     e4 = sub.add_parser("e4", help="context-limitation sweep and reading times")
@@ -360,7 +551,21 @@ def build_parser() -> argparse.ArgumentParser:
     e4.add_argument("--subtlex", default=None)
     e4.add_argument("--n-boot", type=int, default=200)
     e4.add_argument("--n-folds", type=int, default=None)
+    e4.add_argument("--stage", choices=["all", "sweep", "boot"], default="all")
+    e4.add_argument("--reference", action="append", default=None, metavar="NAME=DIR",
+                    help="a build directory of another checkpoint on the frozen "
+                         "candidate sets; repeatable")
+    e4.add_argument("--tilted-from", default=None, metavar="DIR",
+                    help="an E3 output directory whose prepared tilts become references")
+    shard(e4, "boot", "argmax bootstrap replicate")
     e4.set_defaults(func=cmd_e4)
+
+    mg = sub.add_parser("merge", help="combine shards into the registered tables")
+    mg.add_argument("--out", default="artifacts")
+    mg.add_argument("--legs", default="e2,e3,e4")
+    mg.add_argument("--estimators", nargs="+", default=["naive", "repaired"])
+    mg.add_argument("--margin", type=float, default=0.25, help="TOST margin for E3")
+    mg.set_defaults(func=cmd_merge)
 
     st = sub.add_parser("selftest", help="synthetic end-to-end run, no data, no GPU")
     st.add_argument("--out", default="artifacts/selftest")

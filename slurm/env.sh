@@ -32,3 +32,25 @@ else
     echo "no virtualenv at $LCSA_VENV; run slurm/setup.sh on a login node first" >&2
     exit 2
 fi
+
+# Registered replicate counts and the number of array tasks each loop is cut
+# into.  Every replicate is seeded from the run seed and its own index, so the
+# cut changes wall clock and nothing else; `lcsa merge` checks that the shards
+# tile [0, N) with no gap or overlap.
+export N_REP="${N_REP:-200}"; export N_BOOT="${N_BOOT:-200}"
+export E2_SHARDS="${E2_SHARDS:-20}"; export E3_SHARDS="${E3_SHARDS:-20}"
+export E3_BOOT_SHARDS="${E3_BOOT_SHARDS:-10}"; export E4_SHARDS="${E4_SHARDS:-10}"
+export E3_READERS="${E3_READERS:-N0 N0-PRIME N-LEX N-TOPIC N-ORDER}"
+# Reference checkpoints for E4 and the ladder generator, built on the primary's
+# frozen candidate sets by build_refs.sbatch; slugs replace "/" with "_".
+export LCSA_REFS="${LCSA_REFS:-gpt2-large gpt2 Qwen/Qwen2.5-0.5B}"
+export E2_GEN_REF="${E2_GEN_REF:-gpt2-large}"
+export E3_SELF_REF="${E3_SELF_REF:-gpt2}"
+
+# shard_range I N TOTAL -> "start stop" for array task I of N over [0, TOTAL).
+shard_range() {
+    local i=$1 n=$2 total=$3
+    local start=$(( i * total / n )) stop=$(( (i + 1) * total / n ))
+    echo "$start $stop"
+}
+ref_dir() { echo "$LCSA_ROOT/build_${1//\//_}"; }

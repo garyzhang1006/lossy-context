@@ -155,6 +155,7 @@ def build_corpus(
     select=None,
     keep_words: list | None = None,
     keep_keys: list | None = None,
+    candidates: dict | None = None,
 ) -> Corpus:
     """Build the full nested cache.  This is the GPU-heavy step of the pipeline.
 
@@ -164,6 +165,11 @@ def build_corpus(
     given, is appended with the candidate list of every target that was built,
     in the same order as the corpus, so that a caller needing the strings does
     not have to reconstruct them and risk a different candidate set.
+
+    ``candidates`` freezes the candidate list per ``(text_id, word_number)``:
+    targets absent from it are skipped and the expansion step is not run, so a
+    cache built under another checkpoint has row for row the same candidate
+    sets as the primary build and can stand in for it as a reference.
     """
     cfg = cfg or BuildConfig()
 
@@ -201,11 +207,17 @@ def build_corpus(
         if select is not None and not select(int(r.text_id), int(r.word_number), K):
             continue
 
-        full_ctx = " ".join(passage[:ti])
-        expansions = _expansion_words(scorer, full_ctx, cfg.top_k_expansions)
-        words = candidate_set(
-            [str(x) for x in grp["response"].tolist()], str(r.word), expansions, cfg
-        )
+        if candidates is not None:
+            frozen = candidates.get(key)
+            if frozen is None:
+                continue
+            words = [str(w) for w in frozen]
+        else:
+            full_ctx = " ".join(passage[:ti])
+            expansions = _expansion_words(scorer, full_ctx, cfg.top_k_expansions)
+            words = candidate_set(
+                [str(x) for x in grp["response"].tolist()], str(r.word), expansions, cfg
+            )
         index = {w: i for i, w in enumerate(words)}
 
         counts = np.zeros(len(words), dtype=np.float64)

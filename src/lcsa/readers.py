@@ -53,6 +53,8 @@ __all__ = [
     "reader_n0_prime",
     "calibrate_n0_prime",
     "null_distributions",
+    "tilt_directions",
+    "tilted_cache",
     "calibrate_alpha",
     "reader_ladder",
     "human_js",
@@ -205,26 +207,24 @@ def calibrate_n0_prime(
             "baseline": base, "at_bound": False}
 
 
-def null_distributions(
+def tilt_directions(
     corpus: Corpus,
     h_list: list[np.ndarray],
-    alpha: float,
     theta0: np.ndarray | None = None,
     model: Model | None = None,
     orthogonalise: bool = True,
     kernel=POWER,
 ) -> list[np.ndarray]:
-    """``q_0 ∝ p_ref^{(K)} exp(alpha h)`` with retention exactly one everywhere.
+    """The unit-scale tilt direction per target, orthogonalised against the span.
 
-    ``p_ref^{(K)}`` is the full-context row of the cache, which is what the
-    truncation mixture returns at ``delta = 0``, so the generated reader has no
-    context decay by construction rather than by approximation.
+    This is the only expensive part of a substantive null and it does not depend
+    on ``alpha``, so it is computed once, saved by ``lcsa e3 --stage prepare``
+    and reused by the E4 sweep to tilt every row of the same cache.
     """
     if orthogonalise and (theta0 is None or model is None):
         raise ValueError("orthogonalising against the span needs theta0 and a model")
     out = []
     for t, tgt in enumerate(corpus):
-        base = np.log(np.clip(tgt.P[-1], PROB_FLOOR, None))
         h = np.asarray(h_list[t], dtype=np.float64)
         if h.shape != (tgt.V,):
             raise ValueError(
@@ -239,10 +239,51 @@ def null_distributions(
         sd = h.std()
         if sd > 0:
             h = h / sd  # unit scale, so alpha means the same thing everywhere
-        z = base + alpha * h
-        z -= z.max()
-        q = np.exp(z)
-        out.append(q / q.sum())
+        out.append(h)
+    return out
+
+
+def _tilt_row(row: np.ndarray, h: np.ndarray, alpha: float) -> np.ndarray:
+    z = np.log(np.clip(row, PROB_FLOOR, None)) + alpha * h
+    z -= z.max()
+    q = np.exp(z)
+    return q / q.sum()
+
+
+def null_distributions(
+    corpus: Corpus,
+    h_list: list[np.ndarray],
+    alpha: float,
+    theta0: np.ndarray | None = None,
+    model: Model | None = None,
+    orthogonalise: bool = True,
+    kernel=POWER,
+    directions: list[np.ndarray] | None = None,
+) -> list[np.ndarray]:
+    """``q_0 ∝ p_ref^{(K)} exp(alpha h)`` with retention exactly one everywhere.
+
+    ``p_ref^{(K)}`` is the full-context row of the cache, which is what the
+    truncation mixture returns at ``delta = 0``, so the generated reader has no
+    context decay by construction rather than by approximation.  ``directions``
+    short-circuits the orthogonalisation when :func:`tilt_directions` has
+    already been run.
+    """
+    if directions is None:
+        directions = tilt_directions(corpus, h_list, theta0, model, orthogonalise, kernel)
+    return [_tilt_row(tgt.P[-1], directions[t], alpha) for t, tgt in enumerate(corpus)]
+
+
+def tilted_cache(corpus: Corpus, directions: list[np.ndarray], alpha: float) -> list[np.ndarray]:
+    """Every ablation row tilted by the same ``exp(alpha h)``: a zero-decay reference.
+
+    Its full-context row is the null's ``q_0`` and its depth-``j`` row is the
+    reference's own depth-``j`` row under the same tilt, so the E4 sweep can run
+    on it exactly as on a cache built under another checkpoint, at no GPU cost.
+    """
+    out = []
+    for t, tgt in enumerate(corpus):
+        h = np.asarray(directions[t], dtype=np.float64)
+        out.append(np.stack([_tilt_row(tgt.P[j], h, alpha) for j in range(tgt.K + 1)]))
     return out
 
 
@@ -273,9 +314,10 @@ def calibrate_alpha(
     percent tolerance is the one registered in the design.
     """
     rng_seed = seed
+    dirs = tilt_directions(corpus, h_list, theta0, model, orthogonalise, kernel)
 
     def stat(a: float) -> float:
-        q = null_distributions(corpus, h_list, a, theta0, model, orthogonalise, kernel)
+        q = null_distributions(corpus, h_list, a, directions=dirs)
         counts = draw_counts(corpus, q, np.random.default_rng(rng_seed))
         return js_statistic(counts, [t.P[-1] for t in corpus])
 

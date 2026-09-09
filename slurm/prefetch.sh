@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Run on a login node before the first GPU job.  Downloads the reference
-# checkpoint into HF_HOME (for clusters whose compute nodes have no outbound
+# Run on a login node before the first GPU job.  Downloads the primary and the
+# three reference checkpoints into HF_HOME (for clusters whose compute nodes have no outbound
 # network) and checks that the two corpora are where the jobs expect them.
 # Provo (https://osf.io/sjefs/) and SUBTLEX-US
 # (https://www.ugent.be/pp/experimentele-psychologie/en/research/documents/subtlexus)
@@ -12,9 +12,9 @@ set -euo pipefail
 python - <<'PY'
 import os
 from huggingface_hub import snapshot_download
-p = snapshot_download(os.environ["LCSA_MODEL"],
-                      allow_patterns=["*.json", "*.safetensors", "*.txt", "*.model"])
-print(f"{os.environ['LCSA_MODEL']} -> {p}")
+for m in [os.environ["LCSA_MODEL"], *os.environ["LCSA_REFS"].split()]:
+    p = snapshot_download(m, allow_patterns=["*.json", "*.safetensors", "*.txt", "*.model"])
+    print(f"{m} -> {p}")
 PY
 missing=0
 for f in "$LCSA_PROVO/Provo_Corpus-Predictability_Norms.csv" \

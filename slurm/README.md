@@ -12,9 +12,10 @@ cpu-limited, `scu-gpu` takes normal and gpu-limited, both reject low), so no
 script sets `--qos` and the partition default applies. Without `--mem` a job
 gets 8000M and without `--time` it gets the partition maximum, which is seven
 days on `scu-cpu`, so every script sets both. `scu-gpu` caps at two days, and
-the GPU jobs here ask for twelve hours (build) and thirty-six hours (E3), both
-well below that. The preempt partitions are not used because a build cancelled
-at hour ten restarts from zero.
+the GPU jobs here ask for twelve hours each, well below that. The preempt
+partitions are not used because a build cancelled at hour ten restarts from
+zero. The user cap of 250 running jobs is above the largest array here, the
+100 tasks of `e3_reps.sbatch`.
 
 All output goes under `/athena/accardilab/scratch/$USER/lossy-context`, on
 Lustre and mounted on login and compute nodes alike. The Hugging Face cache
@@ -26,8 +27,20 @@ module (nvcc only) and apptainer are not needed.
 The build pins `gpu:l40s:1`. A single L40S has 46 GB, far more than the 1.5B
 model in float16 needs, and pinning keeps the smoke-run throughput figure
 comparable to the full build on the same card. Nothing here uses more than one
-GPU, so the PCIe-only interconnect is irrelevant. E3 asks for `gpu:1` of any
-type because its GPU phase is short relative to the CPU fits that follow.
+GPU, so the PCIe-only interconnect is irrelevant. The reference builds and the
+E3 prepare stage ask for `gpu:1` of any type because they are short.
+
+## Why shards
+
+Every replicate loop seeds replicate `b` from the run seed and `b` alone, so
+the loop can be cut into any number of array tasks without changing a number,
+and `lcsa merge` concatenates the shards and refuses a set with a gap or an
+overlap. The counts in `env.sh` (`E2_SHARDS=20`, `E3_SHARDS=20`,
+`E3_BOOT_SHARDS=10`, `E4_SHARDS=10`) cut the registered 200 replicates into
+tasks of ten or twenty, so the whole estimation half runs in the time of its
+slowest task rather than the sum. The paper budgets the one-process CPU legs
+at about 90 core-hours; spread over roughly 150 concurrent tasks the wall
+clock after the builds is set by the ladder and the sweep, a few hours each.
 
 ## Order of operations
 
@@ -43,24 +56,34 @@ type because its GPU phase is short relative to the CPU fits that follow.
 3. `bash slurm/prefetch.sh` downloads Qwen/Qwen2.5-1.5B into the shared cache
    and checks that step 2 is complete.
 4. `bash slurm/pipeline.sh` submits the chain below. If the compute nodes have
-   no outbound network, run it as `HF_HUB_OFFLINE=1 bash slurm/pipeline.sh`.
+   no outbound network, run it as `HF_HUB_OFFLINE=1 bash slurm/pipeline.sh`
+   after prefetching `gpt2-large`, `gpt2` and `Qwen/Qwen2.5-0.5B` as well.
 
 | script | partition | resources | limit | does |
 | --- | --- | --- | --- | --- |
 | `build.sbatch` | scu-gpu | 1 L40S, 8 cpu, 48000M | 12 h | selftest, a 20-target smoke build with a throughput extrapolation, then the full build at the registered settings |
-| `estimate.sbatch` | scu-cpu | array 0-2, 4 cpu, 32000M | 3 d | E1, E2 and E4 on the cache, one array task each |
-| `e3.sbatch` | scu-gpu | 1 GPU, 8 cpu, 48000M | 36 h | the lexical, topic and order nulls and the human fit |
+| `build_refs.sbatch` | scu-gpu | array 0-2, 1 GPU, 8 cpu, 48000M | 12 h | GPT-2-large, GPT-2-small and Qwen2.5-0.5B caches on the primary's frozen candidate sets |
+| `e1.sbatch` | scu-cpu | 4 cpu, 16000M | 12 h | exactness, sensitivity, residual fractions |
+| `e2_ladder.sbatch` | scu-cpu | 4 cpu, 16000M | 12 h | the ladder generated under GPT-2-large and fitted under Qwen, plus `e2_theta0.json` |
+| `e2_cov.sbatch` | scu-cpu | array of `E2_SHARDS`, 4 cpu, 16000M | 12 h | coverage replicates at rungs 4 and 8 |
+| `e3_prepare.sbatch` | scu-gpu | 1 GPU, 8 cpu, 48000M | 12 h | the constrained fit, the N0-PRIME calibration and the lexical, topic and order tilts |
+| `e3_reps.sbatch` | scu-cpu | array of readers x `E3_SHARDS`, 4 cpu, 16000M | 12 h | null replicates per reader |
+| `e3_human.sbatch` | scu-cpu | array 0-`E3_BOOT_SHARDS`, 4 cpu, 16000M | 12 h | task 0 the human fit, the rest the paired contrast bootstrap |
+| `e3_self.sbatch` | scu-cpu | 4 cpu, 16000M | 24 h | the plain floor under the GPT-2-small cache |
+| `e4_sweep.sbatch` | scu-cpu | 4 cpu, 32000M | 24 h | the sweep under six references, reading-time gains, hard-window likelihoods |
+| `e4_boot.sbatch` | scu-cpu | array of `E4_SHARDS`, 4 cpu, 32000M | 12 h | the argmax bootstrap under the same references |
+| `merge.sbatch` | scu-cpu | 2 cpu, 8000M | 1 h | `lcsa merge` and the gate summary |
 
-The estimation jobs depend on the build with `afterok`, so a failed build
-leaves them pending and `scancel` clears them. `build.sbatch` skips the full
-build when `build/cache.npz` already exists, so resubmitting after a partial
-run costs only the smoke pass. `N_REP` and `N_BOOT` are read from the
-environment by the estimation scripts, so a first pass at
-`N_REP=20 N_BOOT=20 bash slurm/pipeline.sh` exercises every leg at a fraction
-of the registered cost.
+Every job depends on its inputs with `afterok`, so a failed stage leaves its
+dependants pending and `scancel` clears them. `build.sbatch` and
+`build_refs.sbatch` skip a build whose `cache.npz` exists, so resubmitting
+after a partial run costs only the smoke pass. `N_REP`, `N_BOOT` and the
+shard counts are read from the environment, so
+`N_REP=20 N_BOOT=20 E2_SHARDS=2 E3_SHARDS=2 E3_BOOT_SHARDS=2 E4_SHARDS=2 bash slurm/pipeline.sh`
+exercises every stage at a fraction of the registered cost. A shard that
+failed can be resubmitted alone with the same `--rep-start` and `--rep-stop`
+and `merge.sbatch` rerun; the replicate seeding guarantees the same rows.
 
 Once the chain has run, `sacct -j <id> --format=JobID,Elapsed,MaxRSS,State`
 gives the numbers to tighten `--mem` and `--time` for the next submission.
-The 90 core-hour estimate for the CPU fits in the top-level README is a paper
-budget at 2.5 TFLOP/s and eager attention on Turing GPUs, and the three-day
-limit on `estimate.sbatch` is a ceiling rather than a forecast.
+The limits above are ceilings rather than forecasts.

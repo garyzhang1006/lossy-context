@@ -111,6 +111,46 @@ read the gate record and understand which check fired.
 are built from the reference model's own behaviour on shuffled or averaged context.
 The lexical null needs only the cache, so `--nulls lex` runs on CPU alone.
 
+### Stages and shards
+
+Every replicate loop seeds replicate `b` from the run seed and `b` alone, so a
+range of replicates computed in one process is the same numbers whether or not
+the others ran alongside it. Each leg therefore splits into a stage that runs
+once and shards that any number of processes can compute, and `lcsa merge`
+concatenates the shards and applies the same summariser the one-process run
+uses. The test suite checks that the two paths write byte-identical artifacts.
+
+```bash
+lcsa e2 --cache C --gen-cache R --out A --stage ladder
+lcsa e2 --cache C --gen-cache R --out A --stage coverage --n-rep 200 --rep-start 0 --rep-stop 10
+lcsa e3 --cache C --out A --stage prepare --nulls lex,topic,order --provo-dir data/provo
+lcsa e3 --cache C --out A --stage replicates --readers N0-PRIME --n-rep 200 --rep-start 0 --rep-stop 10
+lcsa e3 --cache C --out A --stage human
+lcsa e3 --cache C --out A --stage contrast --n-boot 200 --boot-start 0 --boot-stop 20
+lcsa e4 --cache C --out A --stage sweep --provo-dir data/provo --reference gpt2-large=R_DIR --tilted-from A
+lcsa e4 --cache C --out A --stage boot --provo-dir data/provo --reference gpt2-large=R_DIR \
+    --tilted-from A --n-boot 200 --boot-start 0 --boot-stop 20
+lcsa merge --out A --legs e2,e3,e4
+```
+
+Shards land under `A/shards/` as JSON files named by their replicate range, and
+`merge` refuses a set of shards that overlaps, has a gap, or does not start at
+zero. The E2 ladder stage writes the nuisance vector to `e2_theta0.json` and
+the E3 prepare stage writes `e3_prepared.npz`, so no shard refits anything the
+stage already fitted.
+
+### Reference caches
+
+The pre-registration sweeps the context-limitation curve across five
+zero-decay references and generates the recovery ladder under GPT-2-large.
+`lcsa build --candidates B/candidates.json --targets B/targets.csv --model M`
+builds a cache under another checkpoint on the primary build's frozen
+candidate sets, so its rows align with the primary's and `--gen-cache` on `e2`
+and `--reference NAME=DIR` on `e4` can use it. `--tilted-from A` adds the
+N-TOPIC and N-ORDER tilts that `e3 --stage prepare` calibrated as two further
+references at no GPU cost. The self-reference certification of the plain floor
+is `lcsa e3 --cache GPT2_SMALL_CACHE --nulls none --readers N0 --no-human`.
+
 ## Kaggle
 
 Two notebooks under `notebooks/` split along the same seam. Run `01_build_gpu.ipynb`
@@ -127,10 +167,13 @@ smoke run at 20 replicates is a reasonable first pass.
 
 ## Slurm
 
-`slurm/` holds job scripts for the SCU cluster: a GPU build on `scu-gpu`, the
-CPU legs as an array on `scu-cpu`, and E3 on its own GPU job, chained with
-`afterok` by `slurm/pipeline.sh`. `slurm/README.md` explains the partition and
-QoS constraints the scripts encode and the order to run them in.
+`slurm/` holds job scripts for the SCU cluster: the GPU build and the three
+reference builds on `scu-gpu`, the E3 prepare stage on a GPU, and every
+replicate loop as a `scu-cpu` array of shards, chained with `afterok` by
+`slurm/pipeline.sh` and combined by `merge.sbatch`. At the default shard
+counts the registered run finishes in about half a day of wall clock after the
+builds. `slurm/README.md` explains the partition and QoS constraints the
+scripts encode and the order to run them in.
 
 ## Repository layout
 

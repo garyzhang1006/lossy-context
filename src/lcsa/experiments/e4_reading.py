@@ -11,7 +11,9 @@ one, then reading-time fit is not the external check it is usually taken for.
 
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 
 import numpy as np
 
@@ -21,11 +23,13 @@ from lcsa.kernels import POWER
 from lcsa.likelihood import Model
 from lcsa.readingtime import RTResult, _fit_ll, _gauss_ll, reading_time_gain, spillover
 from lcsa.experiments import Artifacts
+from lcsa.experiments.shards import denull, read_shards, write_shard
 
 log = logging.getLogger(__name__)
 
 __all__ = ["K_GRID", "gaze_table", "window_surprisal", "heldout_delta_ll", "sweep_reference",
-           "argmax_bootstrap", "rt_gain_table", "run"]
+           "argmax_picks", "summarise_argmax", "argmax_bootstrap", "rt_gain_table",
+           "run_sweep", "load_stage", "run_argmax_shard", "assemble", "merge", "run"]
 
 #: The context-limitation grid, in words of preceding context.
 K_GRID = (0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
@@ -70,10 +74,17 @@ def gaze_table(provo, keys, unigrams=None, measure: str = "gaze"):
 def window_surprisal(corpus: Corpus, k: int, P_override=None) -> np.ndarray:
     """``-log p_ref(w_t | last k words)`` for each target's own word.
 
-    ``P_override`` supplies an alternative cache, which is how the tilted
-    zero-decay references enter the sweep at no marginal GPU cost: they are the
-    same ablation block with an exponential tilt applied to every row.
+    ``P_override`` supplies an alternative reference: a list of ablation blocks
+    in the corpus's target order, which is how the tilted zero-decay references
+    enter the sweep at no marginal GPU cost, or a whole :class:`Corpus` built
+    under another checkpoint on the same frozen candidate sets.
     """
+    if isinstance(P_override, Corpus):
+        if len(P_override) != len(corpus):
+            raise ValueError(
+                f"the reference cache has {len(P_override)} targets but the primary has "
+                f"{len(corpus)}; references must be built on the primary's targets.csv")
+        return window_surprisal(P_override, k)
     out = np.full(len(corpus), np.nan, dtype=np.float64)
     for t, tgt in enumerate(corpus):
         i = int(tgt.target_slot)
@@ -156,6 +167,63 @@ def sweep_reference(
             "k_grid": list(int(k) for k in k_grid)}
 
 
+def argmax_picks(
+    corpus: Corpus,
+    gaze: np.ndarray,
+    controls: np.ndarray,
+    passage: np.ndarray,
+    P_override=None,
+    k_grid=K_GRID,
+    reps=range(200),
+    n_folds: int = 5,
+    use_mixed: bool = False,
+    seed: int = 0,
+) -> list[dict]:
+    """The selected window on each passage resample ``b`` in ``reps``.
+
+    Replicate ``b`` resamples passages from ``seed + b + 1``, so a shard of
+    replicates is the same numbers whether or not the others ran alongside it.
+    A replicate on which no grid point gives a finite gain records ``None``.
+    """
+    passage = np.asarray(passage)
+    uniq = np.unique(passage)
+    surp = {int(k): window_surprisal(corpus, int(k), P_override) for k in k_grid}
+    rows = []
+    for b in reps:
+        rng = np.random.default_rng(seed + b + 1)
+        pick = rng.choice(uniq, size=uniq.size, replace=True)
+        idx = np.concatenate([np.flatnonzero(passage == p) for p in pick])
+        best_k, best_v = None, -np.inf
+        for k in k_grid:
+            v = heldout_delta_ll(gaze[idx], np.asarray(controls)[idx],
+                                 surp[int(k)][idx], passage[idx], n_folds,
+                                 use_mixed, seed)
+            if np.isfinite(v) and v > best_v:
+                best_k, best_v = int(k), v
+        rows.append({"replicate": int(b), "best_k": best_k})
+    return rows
+
+
+def summarise_argmax(rows: list[dict]) -> dict:
+    """Distribution of the selected window over replicate rows.
+
+    A replicate with no finite gain carries ``None`` in memory and ``nan`` after
+    a shard round trip; both mean the same unusable replicate.
+    """
+    picks = [int(r["best_k"]) for r in rows
+             if r.get("best_k") is not None and np.isfinite(r["best_k"])]
+    if not picks:
+        return {"n_boot": int(len(rows)), "n_usable": 0, "distribution": {}}
+    vals, counts = np.unique(np.asarray(picks), return_counts=True)
+    return {
+        "n_boot": int(len(rows)),
+        "n_usable": len(picks),
+        "distribution": {int(v): int(c) for v, c in zip(vals, counts)},
+        "mode_k": int(vals[int(np.argmax(counts))]),
+        "median_k": float(np.median(picks)),
+    }
+
+
 def argmax_bootstrap(
     corpus: Corpus,
     gaze: np.ndarray,
@@ -174,33 +242,8 @@ def argmax_bootstrap(
     summary is the distribution over grid points rather than a point estimate
     with an interval drawn around it.
     """
-    passage = np.asarray(passage)
-    uniq = np.unique(passage)
-    surp = {int(k): window_surprisal(corpus, int(k), P_override) for k in k_grid}
-    picks = []
-    for b in range(n_boot):
-        rng = np.random.default_rng(seed + b + 1)
-        pick = rng.choice(uniq, size=uniq.size, replace=True)
-        rows = np.concatenate([np.flatnonzero(passage == p) for p in pick])
-        best_k, best_v = None, -np.inf
-        for k in k_grid:
-            v = heldout_delta_ll(gaze[rows], np.asarray(controls)[rows],
-                                 surp[int(k)][rows], passage[rows], n_folds,
-                                 use_mixed, seed)
-            if np.isfinite(v) and v > best_v:
-                best_k, best_v = int(k), v
-        if best_k is not None:
-            picks.append(best_k)
-    if not picks:
-        return {"n_boot": int(n_boot), "n_usable": 0, "distribution": {}}
-    vals, counts = np.unique(np.asarray(picks), return_counts=True)
-    return {
-        "n_boot": int(n_boot),
-        "n_usable": len(picks),
-        "distribution": {int(v): int(c) for v, c in zip(vals, counts)},
-        "mode_k": int(vals[int(np.argmax(counts))]),
-        "median_k": float(np.median(picks)),
-    }
+    return summarise_argmax(argmax_picks(corpus, gaze, controls, passage, P_override,
+                                         k_grid, range(n_boot), n_folds, use_mixed, seed))
 
 
 def rt_gain_table(
@@ -249,6 +292,110 @@ def rt_gain_table(
     return rows
 
 
+STAGE_JSON = "e4_stage.json"
+
+
+def run_sweep(
+    corpus: Corpus,
+    gaze: np.ndarray,
+    controls: np.ndarray,
+    passage: np.ndarray,
+    models,
+    out_dir,
+    references: dict | None = None,
+    fitted: dict | None = None,
+    k_grid=K_GRID,
+    n_folds: int | None = None,
+    use_mixed: bool = True,
+    seed: int = 0,
+) -> dict:
+    """Stage one of E4: every deterministic table, saved so the shards can skip it.
+
+    The sweep, the reading-time gains and the hard-window likelihoods have no
+    replicate loop, so they run once here and the argmax shards only resample.
+    """
+    art = Artifacts(out_dir, "e4")
+    refs = {"primary": None} if not references else references
+    sweeps, flat = {}, []
+    for name, override in refs.items():
+        sw = sweep_reference(corpus, gaze, controls, passage, name, override, k_grid,
+                             n_folds, use_mixed, seed)
+        sweeps[name] = sw
+        for c in sw["curve"]:
+            flat.append({"reference": name, **c})
+    art.table("e4_sweep_curves", flat)
+    stage = {"references": list(refs), "sweeps": sweeps,
+             "model_free": context_slopes(corpus)}
+    if fitted:
+        rows = rt_gain_table(corpus, gaze, controls, passage, fitted, n_folds=5,
+                             use_mixed=use_mixed, seed=seed)
+        art.table("e4_rt_gain", rows)
+        stage["rt_gain"] = rows
+    hw = hard_window_sweep(corpus, models[0], windows=tuple(k_grid), n_folds=5, seed=seed)
+    art.table("e4_hard_window_likelihood", hw)
+    stage["hard_window_likelihood"] = [h.__dict__ for h in hw]
+    stage["hard_window_agreement"] = sweep_disagreement({"cloze": hw})
+    art.save("e4_stage", stage)
+    return stage
+
+
+def load_stage(out_dir) -> dict:
+    p = Path(out_dir) / STAGE_JSON
+    if not p.exists():
+        raise FileNotFoundError(f"{p} is missing; run `lcsa e4 --stage sweep` first")
+    return denull(json.loads(p.read_text()))
+
+
+def run_argmax_shard(
+    corpus: Corpus,
+    gaze: np.ndarray,
+    controls: np.ndarray,
+    passage: np.ndarray,
+    out_dir,
+    reps: range,
+    references: dict | None = None,
+    k_grid=K_GRID,
+    seed: int = 0,
+) -> list[dict]:
+    """Stage two of E4: argmax replicates ``reps`` for every reference."""
+    refs = {"primary": None} if not references else references
+    rows = []
+    for name, override in refs.items():
+        for r in argmax_picks(corpus, gaze, controls, passage, override, k_grid, reps,
+                              seed=seed):
+            rows.append({"reference": name, **r})
+    write_shard(out_dir, "e4_argmax", reps, rows)
+    return rows
+
+
+def assemble(stage: dict, boot_rows: list[dict], out_dir) -> dict:
+    """Stage three of E4: the summary from the sweep stage and the argmax rows."""
+    art = Artifacts(out_dir, "e4")
+    by_ref: dict[str, list[dict]] = {name: [] for name in stage["references"]}
+    for r in boot_rows:
+        by_ref.setdefault(r["reference"], []).append(r)
+    boots = {name: summarise_argmax(rows) for name, rows in by_ref.items()}
+    sweeps = stage["sweeps"]
+    res = {
+        "sweeps": sweeps,
+        "argmax_bootstrap": boots,
+        "selected": {n: sw["argmax_k"] for n, sw in sweeps.items()},
+        "prediction_8": _prediction_8(sweeps),
+        "model_free": stage["model_free"],
+    }
+    if "rt_gain" in stage:
+        res["rt_gain"] = stage["rt_gain"]
+    res["hard_window_likelihood"] = stage["hard_window_likelihood"]
+    res["hard_window_agreement"] = stage["hard_window_agreement"]
+    art.save("e4_summary", res)
+    return res
+
+
+def merge(out_dir) -> dict:
+    """Combine the sweep stage and the argmax shards on disk."""
+    return assemble(load_stage(out_dir), read_shards(out_dir, "e4_argmax"), out_dir)
+
+
 def run(
     corpus: Corpus,
     gaze: np.ndarray,
@@ -265,40 +412,11 @@ def run(
     seed: int = 0,
 ) -> dict:
     """Full E4 leg: the sweep across references, the argmax bootstrap, the gains."""
-    art = Artifacts(out_dir, "e4")
-    refs = {"primary": None} if not references else references
-    sweeps, flat = {}, []
-    for name, override in refs.items():
-        s = sweep_reference(corpus, gaze, controls, passage, name, override, k_grid,
-                            n_folds, use_mixed, seed)
-        sweeps[name] = s
-        for c in s["curve"]:
-            flat.append({"reference": name, **c})
-    art.table("e4_sweep_curves", flat)
-
-    boots = {
-        name: argmax_bootstrap(corpus, gaze, controls, passage, refs[name], k_grid,
-                               n_boot=n_boot, seed=seed)
-        for name in refs
-    }
-    res = {
-        "sweeps": sweeps,
-        "argmax_bootstrap": boots,
-        "selected": {n: s["argmax_k"] for n, s in sweeps.items()},
-        "prediction_8": _prediction_8(sweeps),
-        "model_free": context_slopes(corpus),
-    }
-    if fitted:
-        rows = rt_gain_table(corpus, gaze, controls, passage, fitted, n_folds=5,
-                             use_mixed=use_mixed, seed=seed)
-        art.table("e4_rt_gain", rows)
-        res["rt_gain"] = rows
-    hw = hard_window_sweep(corpus, models[0], windows=tuple(k_grid), n_folds=5, seed=seed)
-    art.table("e4_hard_window_likelihood", hw)
-    res["hard_window_likelihood"] = [h.__dict__ for h in hw]
-    res["hard_window_agreement"] = sweep_disagreement({"cloze": hw})
-    art.save("e4_summary", res)
-    return res
+    stage = run_sweep(corpus, gaze, controls, passage, models, out_dir, references,
+                      fitted, k_grid, n_folds, use_mixed, seed)
+    rows = run_argmax_shard(corpus, gaze, controls, passage, out_dir, range(n_boot),
+                            references, k_grid, seed)
+    return assemble(stage, rows, out_dir)
 
 
 def _prediction_8(sweeps: dict) -> dict:

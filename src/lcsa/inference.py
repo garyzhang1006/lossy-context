@@ -233,6 +233,7 @@ def cluster_bootstrap(
     n_boot: int = 200,
     seed: int = 0,
     progress: Callable[[int, int], None] | None = None,
+    reps=None,
 ) -> list[dict]:
     """Paired cluster bootstrap: resample the 55 passages with replacement.
 
@@ -241,23 +242,25 @@ def cluster_bootstrap(
     replicate whose fit lands on the boundary is kept and recorded as such; a
     replicate that raises is recorded with ``error`` rather than dropped, because
     silently dropping non-convergences would bias the distribution toward the
-    paper's own prediction.
+    paper's own prediction.  Replicate ``b`` draws from a generator seeded by
+    ``(seed, b)`` alone, so ``reps`` can be any range of absolute indices and
+    disjoint ranges concatenate into the full run.
     """
-    rng = np.random.default_rng(seed)
     C = corpus.n_clusters
+    reps = list(range(n_boot) if reps is None else reps)
     out: list[dict] = []
-    for b in range(n_boot):
-        draw = rng.integers(0, C, size=C)
+    for i, b in enumerate(reps):
+        draw = np.random.default_rng([int(seed), int(b)]).integers(0, C, size=C)
         try:
             sub = corpus.subset_clusters(draw.tolist())
             rec = dict(statistic(sub))
             rec["error"] = None
         except Exception as exc:  # noqa: BLE001 - recorded, never swallowed
             rec = {"error": f"{type(exc).__name__}: {exc}"}
-        rec["replicate"] = b
+        rec["replicate"] = int(b)
         out.append(rec)
         if progress is not None:
-            progress(b + 1, n_boot)
+            progress(i + 1, len(reps))
     return out
 
 
