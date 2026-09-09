@@ -70,6 +70,7 @@ clock after the builds is set by the ladder and the sweep, a few hours each.
 | `e3_reps.sbatch` | scu-cpu | array of readers x `E3_SHARDS`, 4 cpu, 16000M | 12 h | null replicates per reader |
 | `e3_human.sbatch` | scu-cpu | array 0-`E3_BOOT_SHARDS`, 4 cpu, 16000M | 12 h | task 0 the human fit, the rest the paired contrast bootstrap |
 | `e3_self.sbatch` | scu-cpu | 4 cpu, 16000M | 24 h | the plain floor under the GPT-2-small cache |
+| `confounds.sbatch` | scu-cpu | 4 cpu, 16000M | 12 h | the human counts fitted under each reference cache, with its Provo perplexity |
 | `e4_sweep.sbatch` | scu-cpu | 4 cpu, 32000M | 24 h | the sweep under six references, reading-time gains, hard-window likelihoods |
 | `e4_boot.sbatch` | scu-cpu | array of `E4_SHARDS`, 4 cpu, 32000M | 12 h | the argmax bootstrap under the same references |
 | `merge.sbatch` | scu-cpu | 2 cpu, 8000M | 1 h | `lcsa merge` and the gate summary |

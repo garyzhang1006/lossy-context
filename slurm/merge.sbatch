@@ -17,6 +17,7 @@ lcsa merge --out "$OUT" --legs e2,e3,e4
 cat "$OUT/e2_coverage.csv" "$OUT/e3_rejection_rates.csv"
 SELF="$OUT/self_${E3_SELF_REF//\//_}"
 [ -f "$SELF/e3_rejection_rates.csv" ] && cat "$SELF/e3_rejection_rates.csv"
+[ -f "$OUT/confounds.csv" ] && cat "$OUT/confounds.csv"
 python - "$OUT" <<'PY'
 import json, sys
 from pathlib import Path

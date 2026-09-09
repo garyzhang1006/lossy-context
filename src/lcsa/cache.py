@@ -138,6 +138,33 @@ class ReferenceScorer:
 
     # -- low level ------------------------------------------------------
 
+    def passage_nll(self, words: Sequence[str]) -> tuple[float, int]:
+        """Summed token negative log-likelihood of one passage and its token count.
+
+        The passage is scored as the model reads it, from the bos token if the
+        tokeniser has one, in windows of ``max_prefix_tokens`` with the first
+        token of each later window conditioned on the whole preceding window.
+        Perplexity is ``exp(sum / count)`` over passages; it labels the
+        competence confounds and is not a null of any kind.
+        """
+        torch = self.torch
+        text = " ".join(str(w) for w in words)
+        ids = self._prefix_ids("") + self.tok.encode(text, add_special_tokens=False)
+        total, count = 0.0, 0
+        step = self.max_prefix_tokens
+        start = 0
+        while start + 1 < len(ids):
+            chunk = ids[start:start + step + 1]
+            x = torch.tensor([chunk], dtype=torch.long, device=self.device)
+            with torch.no_grad():
+                logits = self.model(input_ids=x).logits[0, :-1, :].float()
+            lp = torch.log_softmax(logits, dim=-1)
+            tgt = x[0, 1:]
+            total += float(-lp.gather(1, tgt[:, None]).sum())
+            count += int(tgt.numel())
+            start += step
+        return total, count
+
     def _prefix_ids(self, context: str) -> list[int]:
         if not context:
             bos = getattr(self.tok, "bos_token_id", None)

@@ -58,7 +58,7 @@ def _read_keys(path: Path):
 
 
 def cmd_build(args) -> int:
-    from lcsa.build import BuildConfig, build_corpus, gate_g0
+    from lcsa.build import BuildConfig, build_corpus, gate_g0, provo_perplexity
     from lcsa.cache import ReferenceScorer
     from lcsa.data.provo import load_provo, read_provo_csv
     from lcsa.data.subtlex import load_subtlex
@@ -124,6 +124,10 @@ def cmd_build(args) -> int:
     save_corpus(out / "cache.npz", corpus)
     _targets_csv(out / "targets.csv", keys)
     (out / "candidates.json").write_text(json.dumps(words))
+    ppl = provo_perplexity(provo, scorer)
+    (out / "perplexity.json").write_text(json.dumps(ppl, indent=2))
+    log.info("%s Provo token perplexity %.2f over %d tokens", args.model,
+             ppl["perplexity"], ppl["n_tokens"])
 
     # G1 is a throughput measurement, so it is reported from the build itself
     # rather than from a separate benchmark that could differ in shape.
@@ -374,6 +378,30 @@ def cmd_e4(args) -> int:
     return 0
 
 
+def cmd_confounds(args) -> int:
+    """Fit each competence confound's cache and print delta beside its perplexity."""
+    from lcsa.experiments.confounds import run
+    from lcsa.store import load_corpus
+
+    models = _models(args.estimators)
+    refs = {}
+    for spec in args.reference:
+        if "=" not in spec:
+            raise SystemExit(f"--reference takes NAME=DIR, got {spec!r}")
+        name, d = spec.split("=", 1)
+        d = Path(d)
+        if not (d / "cache.npz").exists():
+            raise SystemExit(f"confound {name}: {d / 'cache.npz'} is missing")
+        ppl = None
+        if (d / "perplexity.json").exists():
+            ppl = json.loads((d / "perplexity.json").read_text())
+        refs[name] = (load_corpus(d / "cache.npz"), ppl)
+    rows = run(refs, models, args.out, seed=args.seed)
+    _print([{k: r[k] for k in ("reader", "estimator", "delta_hat", "p_headline",
+                                "perplexity")} for r in rows])
+    return 0
+
+
 def cmd_merge(args) -> int:
     """Combine the stage outputs and shards of each leg into the registered tables."""
     legs = [x.strip().lower() for x in args.legs.split(",") if x.strip()]
@@ -559,6 +587,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="an E3 output directory whose prepared tilts become references")
     shard(e4, "boot", "argmax bootstrap replicate")
     e4.set_defaults(func=cmd_e4)
+
+    cf = sub.add_parser("confounds", help="competence confounds: fits with perplexity")
+    cf.add_argument("--reference", action="append", required=True, metavar="NAME=DIR",
+                    help="a build directory with cache.npz and perplexity.json; repeatable")
+    cf.add_argument("--out", default="artifacts")
+    cf.add_argument("--estimators", nargs="+", default=["naive", "repaired"])
+    cf.add_argument("--seed", type=int, default=0)
+    cf.set_defaults(func=cmd_confounds)
 
     mg = sub.add_parser("merge", help="combine shards into the registered tables")
     mg.add_argument("--out", default="artifacts")

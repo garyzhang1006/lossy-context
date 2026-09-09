@@ -231,3 +231,31 @@ def test_e4_cli_stages_accept_a_frozen_reference_build(built, provo_dir, tmp_pat
     _targets_csv(ref / "targets.csv", keys[1:] + keys[:1])
     with pytest.raises(SystemExit, match="different targets"):
         main([*args, "--stage", "sweep"])
+
+
+def test_passage_perplexity_is_finite_and_counts_every_token(built, scorer):
+    from lcsa.build import provo_perplexity
+
+    provo = built[0]
+    rec = provo_perplexity(provo, scorer)
+    n_expected = sum(len(" ".join(ws).encode("utf-8")) for ws in provo.passages.values())
+    assert rec["n_tokens"] == n_expected
+    assert np.isfinite(rec["perplexity"]) and rec["perplexity"] > 1.0
+    assert set(rec["per_passage"]) == set(provo.passages)
+
+
+def test_confounds_command_prints_delta_beside_perplexity(built, tmp_path):
+    from lcsa.cli import main
+
+    provo, corpus, words, keys = built
+    d = tmp_path / "ref"
+    d.mkdir()
+    save_corpus(d / "cache.npz", corpus)
+    (d / "perplexity.json").write_text(json.dumps({"perplexity": 12.5, "n_tokens": 100}))
+    out = tmp_path / "art"
+    assert main(["confounds", "--reference", f"gpt2={d}", "--out", str(out),
+                 "--estimators", "naive"]) == 0
+    rows = json.loads((out / "confounds.json").read_text())["rows"]
+    assert rows[0]["reader"] == "gpt2" and rows[0]["perplexity"] == 12.5
+    assert rows[0]["kind"] == "competence confound"
+    assert np.isfinite(rows[0]["delta_hat"])

@@ -150,6 +150,10 @@ and `--reference NAME=DIR` on `e4` can use it. `--tilted-from A` adds the
 N-TOPIC and N-ORDER tilts that `e3 --stage prepare` calibrated as two further
 references at no GPU cost. The self-reference certification of the plain floor
 is `lcsa e3 --cache GPT2_SMALL_CACHE --nulls none --readers N0 --no-human`.
+`build` also writes `perplexity.json`, the reference's token perplexity over
+the Provo passages, and `lcsa confounds --reference gpt2=DIR ...` fits the
+human counts under each reference cache and prints that perplexity beside
+every delta, labelled as a competence confound rather than a null.
 
 ## Kaggle
 

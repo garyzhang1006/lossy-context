@@ -23,9 +23,10 @@ echo "e3 reps    $REPS"
 HUM=$(jid --dependency=afterok:$PREP --array=0-$E3_BOOT_SHARDS slurm/e3_human.sbatch)
 echo "e3 human   $HUM"
 SELF=$(jid --dependency=afterok:$REFS slurm/e3_self.sbatch);          echo "e3 self    $SELF"
+CONF=$(jid --dependency=afterok:$REFS slurm/confounds.sbatch);       echo "confounds  $CONF"
 SW=$(jid --dependency=afterok:$REFS:$PREP slurm/e4_sweep.sbatch);     echo "e4 sweep   $SW"
 BOOT=$(jid --dependency=afterok:$REFS:$PREP --array=0-$((E4_SHARDS - 1)) slurm/e4_boot.sbatch)
 echo "e4 boot    $BOOT"
-MERGE=$(jid --dependency=afterok:$COV:$REPS:$HUM:$SELF:$SW:$BOOT slurm/merge.sbatch)
+MERGE=$(jid --dependency=afterok:$COV:$REPS:$HUM:$SELF:$CONF:$SW:$BOOT slurm/merge.sbatch)
 echo "merge      $MERGE"
 echo "watch with: squeue -u \$USER ; logs under $LCSA_ROOT/logs"
