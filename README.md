@@ -125,6 +125,13 @@ deliver with eager attention on Turing. The roughly 30,000 CPU fits that follow 
 about 90 core-hours, which is why `--n-rep` and `--n-boot` are exposed and why a
 smoke run at 20 replicates is a reasonable first pass.
 
+## Slurm
+
+`slurm/` holds job scripts for the SCU cluster: a GPU build on `scu-gpu`, the
+CPU legs as an array on `scu-cpu`, and E3 on its own GPU job, chained with
+`afterok` by `slurm/pipeline.sh`. `slurm/README.md` explains the partition and
+QoS constraints the scripts encode and the order to run them in.
+
 ## Repository layout
 
 `src/lcsa/kernels.py` holds the retention kernel and its analytic derivative.
