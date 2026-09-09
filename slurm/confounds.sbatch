@@ -17,4 +17,4 @@ ENV="${LCSA_REPO:-$SLURM_SUBMIT_DIR}/slurm/env.sh"
 REFARGS=(); for m in $LCSA_REFS; do REFARGS+=(--reference "${m//\//_}=$(ref_dir "$m")"); done
 lcsa confounds --kernel "$LCSA_KERNEL" "${REFARGS[@]}" --cache "$LCSA_ROOT/build/cache.npz" \
     --out "$LCSA_ART"
-cat "$LCSA_ROOT/artifacts/confounds.csv"
+cat "$LCSA_ART/confounds.csv"

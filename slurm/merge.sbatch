@@ -13,8 +13,8 @@ ENV="${LCSA_REPO:-$SLURM_SUBMIT_DIR}/slurm/env.sh"
 [ -f "$ENV" ] || { echo "submit from the repository root or export LCSA_REPO" >&2; exit 2; }
 . "$ENV"
 OUT="$LCSA_ART"
-lcsa merge --out "$OUT" --legs "${MERGE_LEGS:-e2,e3,e4}"
-for f in e2_coverage e3_rejection_rates confounds; do
+lcsa merge --out "$OUT" --legs "${MERGE_LEGS:-e2,e3,e4,e6}"
+for f in e2_coverage e3_rejection_rates confounds e6_panel e5_summary; do
     [ -f "$OUT/$f.csv" ] && cat "$OUT/$f.csv"
 done
 SELF="$OUT/self_${E3_SELF_REF//\//_}"
@@ -33,6 +33,12 @@ if e3:
     print("G4", e3["human"]["g4"]["measured"] if e3.get("human") else None)
 if e4: print("E4 selected k", e4["selected"], "prediction 8", e4["prediction_8"])
 PY
+# The gate table: G7 takes the audited GPU-hours of this account from sacct,
+# summed over the GPU partition's jobs since the build started.
+GPUH=$(sacct -u "$USER" -X -n -p --partition=scu-gpu --format=ElapsedRaw,AllocTRES 2>/dev/null \
+       | awk -F'|' '{ n = 0; if (match($2, /gres\/gpu=[0-9]+/)) n = substr($2, RSTART + 9, RLENGTH - 9); s += $1 * n } END { printf "%.2f", s / 3600 }' || echo "")
+lcsa gates --out "$OUT" --build "$LCSA_ROOT/build" ${GPUH:+--gpu-hours "$GPUH"}
+cat "$OUT/gates.csv"
 # Freeze the outputs: every number in the paper is checked against these hashes
 # with `lcsa manifest --out $OUT --check`.
 lcsa manifest --out "$OUT"

@@ -23,7 +23,8 @@ from lcsa.inference import (cluster_bootstrap, lr_test, rejection_rate, score_te
                             tost)
 from lcsa.kernels import POWER
 from lcsa.likelihood import Model, information
-from lcsa.projection import corpus_residual_fraction
+from lcsa.projection import (corpus_residual_fraction, explained_share, global_residual,
+                             implied_bias, lambda_curvature_leak, split_half_residual)
 from lcsa.readers import (calibrate_alpha, calibrate_n0_prime, draw_counts, human_js,
                           null_distributions, reader_n0_prime, tilt_directions)
 from lcsa.experiments import Artifacts, jsonable
@@ -162,10 +163,17 @@ def fit_and_profile(corpus: Corpus, model: Model, kernel=POWER, seed: int = 0,
         "converged": bool(f.success),
         "at_bound": bool(f.at_bound),
         "T_cr1": float(st.T_cr1), "p_cr1": float(st.p_cr1),
+        "T_cr2": float(st.T_cr2), "p_cr2": float(st.p_cr2), "df_bm": float(st.df_bm),
         "T_cr3": float(st.T_cr3), "p_cr3": float(st.p_cr3),
+        "z": float(st.z),
+        "p_one_cr1": float(st.p_one_cr1), "p_one_cr2": float(st.p_one_cr2),
+        "p_one_cr3": float(st.p_one_cr3),
+        "p_wild": float(st.p_wild), "p_wild_one": float(st.p_wild_one),
+        "n_wild": int(st.n_wild), "wild_enumerated": bool(st.wild_enumerated),
         "p_headline": float(st.p),
         "T_raw": float(st.T_raw), "p_raw": float(st.p_raw),
         "design_effect": float(deff),
+        "max_leverage": float(np.max(st.leverage)) if st.leverage is not None else float("nan"),
         "LR": float(lr.LR), "p_LR": float(lr.p),
         "n_clusters": int(st.n_clusters),
     }
@@ -195,7 +203,11 @@ def _replicate_fit(corp: Corpus, model: Model, kernel, seed: int) -> dict:
         return {"failed": True, "error": str(exc)}
     return {
         "failed": False,
-        "p_headline": float(st.p), "p_cr1": float(st.p_cr1), "p_cr3": float(st.p_cr3),
+        "p_headline": float(st.p), "p_cr1": float(st.p_cr1), "p_cr2": float(st.p_cr2),
+        "p_cr3": float(st.p_cr3), "p_one_cr1": float(st.p_one_cr1),
+        "p_one_cr2": float(st.p_one_cr2), "p_one_cr3": float(st.p_one_cr3),
+        "p_wild": float(st.p_wild), "p_wild_one": float(st.p_wild_one),
+        "df_bm": float(st.df_bm),
         "p_LR": float(lr.p), "T_cr1": float(st.T_cr1), "LR": float(lr.LR),
         "delta_hat": float(f.delta), "design_effect": float(st.design_effect),
         "converged": bool(f.success), "at_bound": bool(f.at_bound),
@@ -278,17 +290,27 @@ def summarise_rates(rows: list[dict], alpha: float = 0.05) -> list[dict]:
         deltas = [r["delta_hat"] for r in ok]
         deffs = [r["design_effect"] for r in ok]
         rate, lo, hi = rejection_rate(p_cr, alpha)
-        rate1, _, _ = rejection_rate([r["p_cr1"] for r in ok], alpha)
-        rate3, _, _ = rejection_rate([r["p_cr3"] for r in ok], alpha)
+
+        def _rate(key: str) -> float:
+            vals = [r[key] for r in ok if key in r and np.isfinite(r[key])]
+            return rejection_rate(vals, alpha)[0] if vals else float("nan")
+
         rate_lr, lo_lr, hi_lr = rejection_rate([r["p_LR"] for r in ok], alpha)
+        dfs = [r["df_bm"] for r in ok if np.isfinite(r.get("df_bm", np.nan))]
         row = {
             "estimator": est,
             "n_replicates": int(len(rs)),
             "n_failed": int(len(rs) - len(ok)),
             "reject_cluster_robust": rate,
             "reject_cr_lo": lo, "reject_cr_hi": hi,
-            "reject_cr1": rate1,
-            "reject_cr3": rate3,
+            "reject_wild_two_sided": _rate("p_wild"),
+            "reject_cr1": _rate("p_cr1"),
+            "reject_cr2_bm": _rate("p_cr2"),
+            "reject_cr3": _rate("p_cr3"),
+            "reject_one_sided_cr1": _rate("p_one_cr1"),
+            "reject_one_sided_cr2_bm": _rate("p_one_cr2"),
+            "reject_one_sided_cr3": _rate("p_one_cr3"),
+            "median_df_bm": float(np.median(dfs)) if dfs else float("nan"),
             "reject_naive_LR": rate_lr,
             "reject_lr_lo": lo_lr, "reject_lr_hi": hi_lr,
             "median_delta_hat": float(np.median(deltas)) if deltas else float("nan"),
@@ -568,6 +590,59 @@ def null_corpora_from(corpus: Corpus, prepared: dict, seed: int) -> dict[str, Co
     return out
 
 
+#: Jeffreys smoothing values at which every absorption fraction is reported.
+ALPHAS = (0.1, 0.5, 1.0)
+#: Random split-half draws averaged in the debiased fractions.
+N_SPLITS = 20
+#: Cluster bootstrap draws behind the implied-bias interval.
+N_BIAS_BOOT = 200
+#: Floor replicates used to check that the debiasing removes pure noise.
+N_RULE_FLOOR = 10
+#: The registered thresholds of the reading rule.
+RULE = {"floor_signal_cap": 0.10, "outside_at_least": 0.50, "absorbable_at_most": 0.25}
+
+
+def reading_rule(corpus: Corpus, prepared: dict, primary: Model, debiased: list[dict],
+                 kernel=POWER, seed: int = 0) -> dict:
+    """The registered reading of the human residual, decided before unblinding.
+
+    The verb the abstract is allowed to use depends on one number, the
+    split-half debiased global residual fraction of the human mismatch under
+    the naive estimator at ``alpha = 0.5``, and on one sanity check, that the
+    same debiasing leaves at most a tenth of the squared norm as signal on the
+    plain floor, where the mismatch is sampling noise by construction.  A
+    fraction of at least one half reads as "outside the tangent space", at
+    most a quarter as "absorbable", and anything between gets no headline verb.
+    """
+    q0 = prepared["readers"].get("N0", {}).get("q")
+    floor_shares = []
+    if q0 is not None:
+        for b in range(N_RULE_FLOOR):
+            rng = np.random.default_rng([int(seed), 4242, b])
+            corp = corpus.with_counts(draw_counts(corpus, q0, rng))
+            nm = fit_constrained(corp, primary, kernel, n_starts=1, seed=seed)
+            sh = split_half_residual(corp, nm.theta, primary, kernel, alpha=0.5,
+                                     n_splits=N_SPLITS, seed=seed + b)
+            floor_shares.append(sh["signal_share_of_norm2"])
+    floor_share = float(np.nanmedian(floor_shares)) if floor_shares else float("nan")
+    human = next((r["fraction_debiased"] for r in debiased
+                  if r["estimator"] == primary.name and r["jeffreys_alpha"] == 0.5),
+                 float("nan"))
+    floor_ok = bool(np.isfinite(floor_share) and floor_share <= RULE["floor_signal_cap"])
+    if not floor_ok or not np.isfinite(human):
+        verdict = "void"
+    elif human >= RULE["outside_at_least"]:
+        verdict = "outside"
+    elif human <= RULE["absorbable_at_most"]:
+        verdict = "absorbable"
+    else:
+        verdict = "indeterminate"
+    return {"verdict": verdict, "human_fraction_debiased": float(human),
+            "floor_signal_share_median": floor_share, "floor_signal_shares": floor_shares,
+            "floor_check_passed": floor_ok, "thresholds": dict(RULE),
+            "estimator": primary.name, "jeffreys_alpha": 0.5}
+
+
 def run_human(
     corpus: Corpus,
     prepared: dict,
@@ -585,25 +660,54 @@ def run_human(
     art = Artifacts(out_dir, "e3")
     fits = [fit_and_profile(corpus, m, kernel, seed=seed) for m in models]
     art.table("e3_human_fit", fits)
-    # The residual fraction is evaluated at each estimator's own constrained
-    # null, since the span it projects against is that estimator's span.
-    resid = []
+    # Every absorption statistic is evaluated at each estimator's own
+    # constrained null, since the tangent space it projects against is that
+    # estimator's.  The global fraction is the quantity in Proposition 2; the
+    # per-target fraction is kept as the lower bound it is.
+    resid, debiased, bias_rows = [], [], []
     for m in models:
         nm = fit_constrained(corpus, m, kernel, n_starts=2, seed=seed)
+        g = global_residual(corpus, nm.theta, m, kernel)
         rep = corpus_residual_fraction(corpus, nm.theta, m, kernel)
         resid.append({
             "estimator": m.name,
-            "residual_fraction": rep.fraction,
+            "residual_fraction_global": g.fraction,
+            "residual_fraction_per_target": g.fraction_per_target,
             "residual_fraction_unweighted": rep.fraction_unweighted,
+            "alignment": g.alignment,
             "span_dim_mean": rep.span_dim_mean,
-            "n_targets": rep.n_targets_used,
+            "n_targets": g.n_targets_used,
         })
+        for a in ALPHAS:
+            sh = split_half_residual(corpus, nm.theta, m, kernel, alpha=a,
+                                     n_splits=N_SPLITS, seed=seed)
+            debiased.append({"estimator": m.name, "jeffreys_alpha": float(a), **sh})
+        ib = implied_bias(corpus, nm.theta, m, kernel, n_boot=N_BIAS_BOOT, seed=seed)
+        lk = lambda_curvature_leak(corpus, nm.theta, m, kernel)
+        row = {"estimator": m.name, **ib,
+               "lambda_coefficient": lk["a_lambda"],
+               "delta_leak_second_order": lk["delta_leak_second_order"],
+               "leak_over_first_order": lk["leak_over_first_order"]}
+        dirs = {k: prepared["readers"][k]["directions"] for k in ("N-TOPIC", "N-ORDER")
+                if k in prepared["readers"] and "directions" in prepared["readers"][k]}
+        if dirs:
+            es = explained_share(corpus, nm.theta, m, dirs, kernel)
+            row.update({"share_explained_topic_order": es["share_explained"],
+                        "share_directions": es["directions"],
+                        "share_coefficients": es["coefficients"],
+                        "share_gram_condition": es["gram_condition"]})
+        bias_rows.append(row)
     art.table("e3_human_residual", resid)
+    art.table("e3_human_residual_debiased", debiased)
+    art.table("e3_human_implied_bias", bias_rows)
+    rule = reading_rule(corpus, prepared, models[0], debiased, kernel, seed)
+    art.save("e3_reading_rule", rule)
     precision = {
         "sd_passage_log_delta": passage_sd_log_delta(corpus, models[0], kernel, seed),
         "within_passage_rho": within_passage_rho(corpus, prepared["theta0"], models[0], kernel),
     }
-    human = {"fits": fits, "residual_fraction": resid, "precision": precision}
+    human = {"fits": fits, "residual_fraction": resid, "residual_debiased": debiased,
+             "implied_bias": bias_rows, "reading_rule": rule, "precision": precision}
     art.save("e3_human_stage", human)
     return human
 
@@ -658,6 +762,9 @@ def assemble(
         res["human"] = {
             "fits": human["fits"],
             "residual_fraction": human["residual_fraction"],
+            "residual_debiased": human.get("residual_debiased"),
+            "implied_bias": human.get("implied_bias"),
+            "reading_rule": human.get("reading_rule"),
             "contrast": contrast,
             "g4": g4_precision(prec["sd_passage_log_delta"], r_pair,
                                prec["within_passage_rho"],

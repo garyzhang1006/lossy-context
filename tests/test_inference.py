@@ -38,11 +38,41 @@ def test_unprojected_statistic_is_the_conservative_one(floor):
     assert res.T_raw <= res.T_cr1 + 1e-8
 
 
-def test_headline_takes_the_more_conservative_of_cr1_and_cr3(floor):
+def test_headline_is_the_one_sided_wild_bootstrap(floor):
     res = score_test(floor, NAIVE)
-    assert res.T == min(res.T_cr1, res.T_cr3)
-    assert res.p == max(res.p_cr1, res.p_cr3)
+    assert res.T == res.T_cr1
+    assert res.p == res.p_wild_one
     assert 0.0 <= res.p <= 1.0
+    assert not res.wild_enumerated and res.n_wild == 999
+    exact = score_test(floor, NAIVE, n_wild=4096)  # twelve clusters: 2048 patterns
+    assert exact.wild_enumerated and exact.n_wild == 2 ** (res.n_clusters - 1)
+    assert abs(exact.p_wild_one - res.p_wild_one) < 0.1
+
+
+def test_leverage_sums_to_one_and_orders_the_denominators(floor):
+    res = score_test(floor, NAIVE)
+    assert abs(res.leverage.sum() - 1.0) < 1e-6
+    assert np.all(res.leverage >= 0.0) and np.all(res.leverage < 1.0)
+    # CR3 inflates more than CR2, which inflates more than the plain sandwich
+    # up to the finite-sample factors, so the statistics are ordered.
+    assert res.T_cr3 <= res.T_cr2 * (res.n_clusters / (res.n_clusters - 1.0)) + 1e-8
+    assert 0.0 < res.df_bm <= res.n_clusters - 1.0 + 1e-6
+
+
+def test_one_sided_p_matches_the_sign_of_the_score_sum(floor):
+    res = score_test(floor, NAIVE)
+    two = res.p_cr1
+    one = res.p_one_cr1
+    if res.numerator > 0:
+        assert abs(one - two / 2.0) < 1e-9
+    else:
+        assert abs(one - (1.0 - two / 2.0)) < 1e-9
+
+
+def test_wild_bootstrap_without_draws_falls_back_to_cr2(floor):
+    res = score_test(floor, NAIVE, n_wild=0)
+    assert np.isnan(res.p_wild_one)
+    assert res.p == res.p_one_cr2
 
 
 def test_design_effect_is_about_one_on_independent_responses(floor):

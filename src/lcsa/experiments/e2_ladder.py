@@ -74,8 +74,12 @@ def fit_rung(
     grid=None,
     profile: bool = True,
     gen_model: Model | None = None,
+    counts: list[np.ndarray] | None = None,
 ) -> dict:
     """Generate one rung's counts, fit it, and profile ``delta``.
+
+    ``counts`` skips the generation, which is how the crossed panel of E6
+    fits counts it drew with a tilt through the same code path.
 
     ``gen_corpus`` carries the generating cache and ``fit_corpus_template`` the
     fitting cache; in the paper these are different checkpoints, so recovery is
@@ -85,8 +89,9 @@ def fit_rung(
     which is what makes the rows of one rung a paired comparison.
     """
     gen_model = model if gen_model is None else gen_model
-    counts = reader_ladder(gen_corpus, d_half, theta_nuisance, gen_model, seed=seed,
-                           kernel=kernel)
+    if counts is None:
+        counts = reader_ladder(gen_corpus, d_half, theta_nuisance, gen_model, seed=seed,
+                               kernel=kernel)
     corp = fit_corpus_template.with_counts(counts)
     f = fit(corp, model, kernel, n_starts=3, seed=seed)
     st = score_test(corp, model, kernel, n_starts=2, seed=seed)
@@ -235,22 +240,61 @@ def coverage_at_rung(
     return summarise_coverage(rows)[0]
 
 
-def identification_ceiling(rows: list[dict], estimator: str | None = None) -> dict:
-    """The largest true ``d_half`` whose reported region is bounded above."""
+#: Rungs at which coverage replicates are run.  4 and 8 feed gate G6; the
+#: rest are the ceiling rungs, replicated so that "bounded above" is a rate.
+COVERAGE_RUNGS = (4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 32.0)
+#: A rung counts as identified when at least this share of replicates bound it.
+CEILING_SHARE = 0.5
+
+
+def identification_ceiling(rows: list[dict], estimator: str | None = None,
+                           n_boot: int = 200, seed: int = 0, share: float = CEILING_SHARE) -> dict:
+    """The ceiling as a rate: the largest rung bounded above in at least half the replicates.
+
+    ``rows`` are per-replicate coverage rows.  A single ladder cannot say
+    whether the region at 16 is bounded above by luck, so the ceiling is read
+    from the share of replicates whose region is bounded above at each rung,
+    and its interval comes from a bootstrap that resamples replicates within
+    each rung and re-reads the ceiling.  Ladder rows without ``replicate`` are
+    accepted too, in which case the share is one or zero per rung and the
+    interval collapses, which is the honest answer for one draw.
+    """
     sel = [r for r in rows if "d_half_true" in r and "unbounded_hi" in r
+           and not r.get("failed") and np.isfinite(r["d_half_true"])
            and (estimator is None or r.get("estimator") == estimator)]
-    bounded = [r["d_half_true"] for r in sel
-               if not r["unbounded_hi"] and np.isfinite(r["d_half_true"])]
-    unbounded = [r["d_half_true"] for r in sel
-                 if r["unbounded_hi"] and np.isfinite(r["d_half_true"])]
+    by_rung: dict[float, list[bool]] = {}
+    for r in sel:
+        by_rung.setdefault(float(r["d_half_true"]), []).append(not bool(r["unbounded_hi"]))
+    rungs = sorted(by_rung)
+    bounded_share = {d: float(np.mean(by_rung[d])) for d in rungs}
+
+    def _ceiling(shares: dict[float, float]) -> float:
+        ok = [d for d in rungs if shares[d] >= share]
+        return float(max(ok)) if ok else float("nan")
+
+    ceiling = _ceiling(bounded_share)
+    draws = []
+    for b in range(n_boot):
+        rng = np.random.default_rng([int(seed), 31, int(b)])
+        boot = {}
+        for d in rungs:
+            v = np.asarray(by_rung[d], dtype=np.float64)
+            boot[d] = float(np.mean(v[rng.integers(0, v.size, size=v.size)]))
+        draws.append(_ceiling(boot))
+    draws = np.asarray(draws)
+    fin = draws[np.isfinite(draws)]
+    lo, hi = (np.percentile(fin, [2.5, 97.5]) if fin.size > 3 else (float("nan"), float("nan")))
+    first_below = next((d for d in rungs if bounded_share[d] < share), None)
     return {
         "estimator": estimator,
-        "ceiling_d_half": float(max(bounded)) if bounded else float("nan"),
-        "first_unbounded_d_half": float(min(unbounded)) if unbounded else None,
-        "bounded_rungs": sorted(float(x) for x in bounded),
-        "in_registered_window_12_to_30": bool(
-            bounded and 12.0 <= max(bounded) <= 30.0
-        ),
+        "ceiling_d_half": ceiling,
+        "ceiling_lo": float(lo), "ceiling_hi": float(hi),
+        "share_bounded_by_rung": {str(d): bounded_share[d] for d in rungs},
+        "n_replicates_by_rung": {str(d): len(by_rung[d]) for d in rungs},
+        "first_rung_below_share": float(first_below) if first_below is not None else None,
+        "share_threshold": float(share),
+        "n_boot": int(n_boot),
+        "in_registered_window_12_to_30": bool(np.isfinite(ceiling) and 12.0 <= ceiling <= 30.0),
     }
 
 
@@ -263,7 +307,7 @@ def run_ladder(
     kernel=POWER,
     seed: int = 0,
 ) -> list[dict]:
-    """Stage one of E2: the eight-rung ladder on the full grid, written to disk."""
+    """Stage one of E2: the eleven-rung ladder on the full grid, written to disk."""
     art = Artifacts(out_dir, "e2")
     rows = ladder_table(gen_corpus, fit_corpus_template, theta_nuisance, models,
                         kernel=kernel, seed=seed, gen_model=models[0])
@@ -280,7 +324,7 @@ def run_coverage_shard(
     out_dir,
     reps: range,
     kernel=POWER,
-    coverage_rungs=(4.0, 8.0),
+    coverage_rungs=COVERAGE_RUNGS,
     seed: int = 0,
 ) -> list[dict]:
     """Stage two of E2: coverage replicates ``reps`` at every rung and estimator."""
@@ -296,18 +340,28 @@ def run_coverage_shard(
 
 def assemble(ladder_rows: list[dict], coverage_rows: list[dict], models, out_dir,
              coverage_rungs=(4.0, 8.0)) -> dict:
-    """Stage three of E2: the coverage table, gate G6 and the ceiling."""
+    """Stage three of E2: the coverage table, gate G6 and the ceiling as a rate.
+
+    G6 is gated on the two shortest rungs only, whatever ``coverage_rungs``
+    holds, because the longer rungs exist to place the ceiling and a ceiling
+    is a finding, not a gate.
+    """
     art = Artifacts(out_dir, "e2")
     cov_rows = summarise_coverage(coverage_rows)
     art.table("e2_coverage", cov_rows)
     primary = models[0].name if hasattr(models[0], "name") else str(models[0])
     names = [m.name if hasattr(m, "name") else str(m) for m in models]
     cov_map = {r["d_half_true"]: r["coverage"] for r in cov_rows if r["estimator"] == primary}
+    gate_rungs = tuple(d for d in (4.0, 8.0) if d in cov_map) or tuple(coverage_rungs[:2])
     res = {
         "ladder": ladder_rows,
         "coverage": cov_rows,
-        "g6": g6_coverage(cov_map, rungs=tuple(coverage_rungs)),
-        "ceiling": [identification_ceiling(ladder_rows, m) for m in names],
+        "g6": g6_coverage(cov_map, rungs=gate_rungs),
+        "ceiling": [identification_ceiling(coverage_rows, m) for m in names],
+        "ceiling_single_ladder": [
+            {"estimator": m,
+             "ceiling_d_half": identification_ceiling(ladder_rows, m, n_boot=0)["ceiling_d_half"]}
+            for m in names],
     }
     art.save("e2_summary", res)
     return res
@@ -334,7 +388,7 @@ def run(
     out_dir,
     kernel=POWER,
     n_rep: int = 200,
-    coverage_rungs=(4.0, 8.0),
+    coverage_rungs=COVERAGE_RUNGS,
     seed: int = 0,
 ) -> dict:
     """Full E2 leg in one process: the ladder, the coverage rungs, and the ceiling."""

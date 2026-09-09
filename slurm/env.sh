@@ -38,12 +38,17 @@ fi
 # cut changes wall clock and nothing else; `lcsa merge` checks that the shards
 # tile [0, N) with no gap or overlap.
 export N_REP="${N_REP:-200}"; export N_BOOT="${N_BOOT:-200}"
-export E2_SHARDS="${E2_SHARDS:-20}"; export E3_SHARDS="${E3_SHARDS:-20}"
+export E2_SHARDS="${E2_SHARDS:-40}"; export E3_SHARDS="${E3_SHARDS:-20}"
 export E3_BOOT_SHARDS="${E3_BOOT_SHARDS:-10}"; export E4_SHARDS="${E4_SHARDS:-10}"
 export E3_READERS="${E3_READERS:-N0 N0-PRIME N-LEX N-TOPIC N-ORDER}"
 # Reference checkpoints for E4 and the ladder generator, built on the primary's
 # frozen candidate sets by build_refs.sbatch; slugs replace "/" with "_".
 export LCSA_REFS="${LCSA_REFS:-gpt2-large gpt2 Qwen/Qwen2.5-0.5B}"
+# The reference sweep of the appendix: four families, 410M to 8B parameters,
+# each fitted on the frozen candidate sets; gpt2-large is shared with LCSA_REFS.
+export LCSA_SWEEP_REFS="${LCSA_SWEEP_REFS:-EleutherAI/pythia-410m EleutherAI/pythia-1.4b Qwen/Qwen2.5-7B meta-llama/Llama-3.1-8B}"
+# E5 and E6 shard counts; E5 needs LCSA_PARTICIPANTS, the per-participant cloze file.
+export E5_SHARDS="${E5_SHARDS:-10}"; export E6_SHARDS="${E6_SHARDS:-20}"
 export E2_GEN_REF="${E2_GEN_REF:-gpt2-large}"
 export E3_SELF_REF="${E3_SELF_REF:-gpt2}"
 # Retention kernel.  "power" is the registered run; LCSA_KERNEL=linear reruns

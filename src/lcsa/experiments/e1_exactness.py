@@ -22,7 +22,7 @@ from lcsa.gates import g2_sensitivity
 from lcsa.kernels import (POWER, delta_from_d_half, marginalise, marginalise_abel,
                           marginalise_and_grad, retention, truncation_weights)
 from lcsa.likelihood import Model, evaluate_target, loglik_and_grad
-from lcsa.projection import corpus_residual_fraction
+from lcsa.projection import corpus_residual_fraction, global_residual
 from lcsa.experiments import Artifacts
 
 log = logging.getLogger(__name__)
@@ -265,11 +265,13 @@ def bridging_report(
 
 def residual_table(readers: dict[str, Corpus], models, kernel=POWER,
                    alphas=(0.1, 0.5, 1.0)) -> list[dict]:
-    """``||h_perp|| / ||h||`` per reader per estimator, at the constrained null.
+    """``||h_perp||_N / ||h||_N`` per reader per estimator, at the constrained null.
 
-    The fraction depends on no fit of ``delta``, which is the point: it can be
-    computed and reported before the human counts are unfrozen, and it is the
-    quantity that says whether the human data sit where absorption bites.
+    The global fraction projects onto the tangent space of one shared nuisance
+    vector and is the quantity of Proposition 2; the per-target fraction lets
+    every context choose its own coefficients and is a lower bound.  Neither
+    depends on a fit of ``delta``, which is the point: both can be computed
+    and reported before the human counts are unfrozen.
     """
     from lcsa.fitting import fit_constrained
 
@@ -283,12 +285,15 @@ def residual_table(readers: dict[str, Corpus], models, kernel=POWER,
                 continue
             for a in alphas:
                 rep = corpus_residual_fraction(corp, null.theta, model, kernel, alpha=a)
+                g = global_residual(corp, null.theta, model, kernel, alpha=a)
                 rows.append({
                     "reader": name,
                     "estimator": model.name,
                     "jeffreys_alpha": float(a),
-                    "residual_fraction": rep.fraction,
+                    "residual_fraction_global": g.fraction,
+                    "residual_fraction_per_target": rep.fraction,
                     "residual_fraction_unweighted": rep.fraction_unweighted,
+                    "alignment": g.alignment,
                     "span_dim_mean": rep.span_dim_mean,
                     "n_targets": rep.n_targets_used,
                 })

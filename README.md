@@ -139,6 +139,33 @@ zero. The E2 ladder stage writes the nuisance vector to `e2_theta0.json` and
 the E3 prepare stage writes `e3_prepared.npz`, so no shard refits anything the
 stage already fitted.
 
+### The participant audit, the crossed panel and the reference sweep
+
+Three legs sit beside the registered four. `lcsa e6` is the crossed panel:
+counts generated with a known half-life at 4, 8 and 16 from the primary cache,
+with and without the N-ORDER mismatch tilted on top at the alpha E3
+calibrated, so `e6_panel.csv` says how far a mismatch of human size moves a
+fitted half-life that E2 recovers cleanly. `lcsa e5` fits a half-life per
+cloze participant with the nuisances pinned at the pooled values and reports
+the split-half reliability and spread of those estimates; it needs the
+per-participant cloze export (`--participants`), which the distributed norms
+do not carry, and `slurm/pipeline.sh` skips it unless `LCSA_PARTICIPANTS`
+points at that file. `slurm/refsweep.sbatch` builds the zero-decay cache of
+Pythia-410M, Pythia-1.4B, Qwen2.5-7B and Llama-3.1-8B on the frozen candidate
+sets and fits the human counts under each, so the half-life can be read across
+four reference families in the appendix. The recovery ladder has eleven rungs,
+2 to 128 and no decay, with 12, 20 and 24 added inside the registered window
+so the identification ceiling is read as a rate rather than as the largest
+rung that passed.
+
+```bash
+lcsa e6 --cache C --out A --stage panel --n-rep 200 --rep-start 0 --rep-stop 10
+lcsa e5 --cache C --out A --participants cloze_by_participant.csv --e3-out A --stage pooled
+lcsa e5 --cache C --out A --participants cloze_by_participant.csv --e3-out A --stage fits \
+    --rep-start 0 --rep-stop 47
+lcsa merge --out A --legs e2,e3,e4,e5,e6
+```
+
 ### Reference caches
 
 The pre-registration sweeps the context-limitation curve across five
@@ -159,6 +186,16 @@ counts under each reference cache and prints that perplexity beside every
 delta, labelled as a competence confound rather than a null, and refits the
 human counts within tertiles of the primary reference's Min-K% score as the
 contamination check.
+
+### Reliability and the gate table
+
+`lcsa reliability --cache CACHE --provo-dir DIR` is gate G3: the debiased
+split-half JS of the cloze counts against the full-context reference, and
+the Spearman-Brown split-half of gaze across halves of the participant set,
+written to `reliability.json`. `lcsa gates --out ART --build BUILD` collects
+G0 to G7 into `gates.csv` from wherever each leg wrote its result, marking a
+gate that has not run as such, and `merge.sbatch` runs it with the audited
+GPU-hours from `sacct` for G7.
 
 ### Kernel and frozen outputs
 

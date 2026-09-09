@@ -8,8 +8,10 @@ from conftest import draw_true_delta, make_corpus
 
 from lcsa.likelihood import NAIVE, REPAIRED, evaluate_target, nuisance_score_matrix
 from lcsa.projection import (centre, corpus_residual_fraction, decompose,
-                             orthogonalise_against_span, orthonormal_span,
-                             residual_fraction, whiten)
+                             explained_share, global_residual, implied_bias,
+                             lambda_curvature_leak, orthogonalise_against_span,
+                             orthonormal_span, residual_fraction,
+                             split_half_residual, whiten)
 
 
 @pytest.fixture(scope="module")
@@ -129,3 +131,112 @@ def test_residual_fraction_is_alpha_sensitive_but_bounded(data):
     fr = [corpus_residual_fraction(data, th, NAIVE, alpha=a).fraction for a in (0.1, 0.5, 1.0)]
     assert all(0.0 <= f <= 1.0 for f in fr)
     assert max(fr) - min(fr) < 0.5
+
+
+# -- the global tangent space -------------------------------------------------
+
+
+def _h_from_nuisance_shift(corpus, theta, model, shift):
+    """A mismatch that a single shared nuisance shift reproduces to first order."""
+    out = []
+    for t in corpus:
+        fit = evaluate_target(t, theta, model, corpus.M)
+        out.append(centre(fit.scores[:, 1:] @ shift, fit.q))
+    return out
+
+
+def test_per_target_fraction_lower_bounds_the_global_one(data):
+    th = np.array([0.0, 0.1, 0.9])
+    g = global_residual(data, th, NAIVE)
+    per = corpus_residual_fraction(data, th, NAIVE)
+    assert g.fraction_per_target == pytest.approx(per.fraction, rel=1e-9)
+    assert g.fraction_per_target <= g.fraction + 1e-9
+    assert 0.0 <= g.fraction <= 1.0 + 1e-9
+
+
+def test_a_shared_nuisance_tilt_is_inside_the_global_tangent_space(data):
+    """The proof of Proposition 2: one phi shift, one coefficient vector, zero residual."""
+    th = np.array([0.0, 0.1, 0.9])
+    shift = np.array([0.3, -0.2])
+    h_list = _h_from_nuisance_shift(data, th, NAIVE, shift)
+    g = global_residual(data, th, NAIVE, h_fn=lambda tgt, q: h_list[tgt.index])
+    assert g.fraction < 1e-4  # the ridge in the solve leaves this much
+    assert np.allclose(g.coefficients, shift, atol=1e-6)
+    assert abs(g.inner_eff) < 1e-6 * max(1.0, g.info_eff)
+
+
+def test_a_target_varying_tilt_is_absorbed_per_target_but_not_globally(data):
+    """Temperature that changes with context length lives in every B_t and outside T."""
+    th = np.array([0.0, 0.1, 0.9])
+    rng = np.random.default_rng(7)
+    h_list = []
+    for t in data:
+        fit = evaluate_target(t, th, NAIVE, data.M)
+        h_list.append(centre(fit.scores[:, 1:] @ rng.normal(size=2), fit.q))
+    g = global_residual(data, th, NAIVE, h_fn=lambda tgt, q: h_list[tgt.index])
+    assert g.fraction_per_target < 1e-7
+    assert g.fraction > 0.3
+
+
+def test_lexical_tilt_is_inside_the_repaired_tangent_space(data):
+    """Prediction 5: a frequency tilt is a shared kappa shift for the repaired estimator."""
+    th_r = np.concatenate([[0.0, 0.1, 0.9], np.zeros(data.M + 1)])
+    h_list = []
+    for t in data:
+        fit = evaluate_target(t, th_r, REPAIRED, data.M)
+        h_list.append(centre(0.4 * t.f[:, 0] if t.f.ndim == 2 else 0.4 * t.f, fit.q))
+    g_r = global_residual(data, th_r, REPAIRED, h_fn=lambda tgt, q: h_list[tgt.index])
+    g_n = global_residual(data, np.array([0.0, 0.1, 0.9]), NAIVE,
+                          h_fn=lambda tgt, q: h_list[tgt.index])
+    assert g_r.fraction < 1e-4
+    assert g_n.fraction > g_r.fraction + 0.1
+
+
+def test_split_half_debiasing_kills_pure_noise(data):
+    """Under the fitted null the mismatch is sampling noise, and the cross product says so."""
+    th = np.array([0.0, 0.1, 0.9])
+    from conftest import draw
+    null = draw(make_corpus(n_targets=40, n_clusters=8, seed=41), th, NAIVE, n_per_target=60, seed=5)
+    from lcsa.fitting import fit_constrained
+    th0 = fit_constrained(null, NAIVE, delta0=0.0, n_starts=1, seed=0).theta
+    raw = global_residual(null, th0, NAIVE)
+    sh = split_half_residual(null, th0, NAIVE, n_splits=10, seed=1)
+    assert raw.fraction > 0.9
+    assert sh["signal_share_of_norm2"] < 0.2
+    assert sh["norm2_perp_debiased"] < 0.2 * raw.norm2_perp
+
+
+def test_split_half_debiasing_keeps_real_decay(data):
+    th0 = np.array([0.0, 0.1, 0.9])
+    sh = split_half_residual(data, th0, NAIVE, n_splits=10, seed=2)
+    assert sh["fraction_debiased"] > 0.5
+    assert sh["norm2_total_debiased"] > 0.0
+
+
+def test_implied_bias_is_positive_under_real_decay(data):
+    th0 = np.array([0.0, 0.1, 0.9])
+    ib = implied_bias(data, th0, NAIVE, n_boot=30, seed=3)
+    assert ib["delta_first_order"] > 0.0
+    assert ib["delta_first_order_lo"] <= ib["delta_first_order"] <= ib["delta_first_order_hi"]
+    assert 0.0 < ib["alignment"] <= 1.0
+    assert ib["n_boot_usable"] == 30
+
+
+def test_lambda_curvature_leak_is_second_order_small(data):
+    th0 = np.array([0.0, 0.1, 0.9])
+    lk = lambda_curvature_leak(data, th0, NAIVE, a_lambda=0.05)
+    assert np.isfinite(lk["delta_leak_second_order"])
+    assert abs(lk["delta_leak_second_order"]) < abs(lk["delta_first_order"])
+    quad = lambda_curvature_leak(data, th0, NAIVE, a_lambda=0.10)
+    assert quad["delta_leak_second_order"] == pytest.approx(4 * lk["delta_leak_second_order"], rel=1e-9)
+
+
+def test_explained_share_is_one_when_the_direction_is_the_mismatch(data):
+    th0 = np.array([0.0, 0.1, 0.9])
+    dirs = {}
+    for t in data:
+        fit = evaluate_target(t, th0, NAIVE, data.M)
+        p_emp = (t.n + 0.5) / (t.N + 0.5 * t.V)
+        dirs.setdefault("SELF", [None] * len(data))[t.index] = np.log(p_emp) - np.log(fit.q)
+    es = explained_share(data, th0, NAIVE, dirs)
+    assert es["share_explained"] == pytest.approx(1.0, abs=1e-6)

@@ -30,7 +30,8 @@ import pandas as pd
 
 log = logging.getLogger(__name__)
 
-__all__ = ["ProvoData", "load_provo", "read_provo_csv", "canonical_word"]
+__all__ = ["ProvoData", "load_provo", "read_provo_csv", "canonical_word",
+           "load_cloze_participants"]
 
 _ENCODINGS = ("utf-8", "latin-1", "cp1252")
 
@@ -45,6 +46,17 @@ _NORM_ALIASES = {
     "text": ["text"],
     "word_content_or_function": ["word_content_or_function"],
     "word_unique_id": ["word_unique_id", "worduniqueid"],
+}
+
+# The distributed predictability norms aggregate responses per word, so a
+# participant-level file has to come from the raw cloze export on OSF or from
+# the authors; its column names are not fixed, hence the aliases.
+_PARTICIPANT_ALIASES = {
+    "participant": ["participant", "participant_id", "participantid", "subject", "subject_id",
+                    "subj", "worker_id", "workerid", "id"],
+    "text_id": ["text_id", "textid"],
+    "word_number": ["word_number", "wordnumber", "word_num"],
+    "response": ["response", "cloze_response", "answer"],
 }
 
 _EYE_ALIASES = {
@@ -258,3 +270,36 @@ def load_provo(
         intersection_size=len(inter),
         encoding=enc,
     )
+
+
+def load_cloze_participants(path: str | Path) -> tuple[pd.DataFrame, str]:
+    """Per-participant cloze responses, one row per (participant, target).
+
+    Returns the frame with the four canonical columns ``participant``,
+    ``text_id``, ``word_number`` and ``response`` and the encoding that read
+    it.  Rows with an empty response are dropped and counted in the log, and a
+    participant who answered the same target twice keeps the first answer, so
+    that every participant contributes at most one response per target and the
+    per-participant count vectors of E5 are 0/1.
+    """
+    df, enc = read_provo_csv(path)
+    cols = _resolve(df, _PARTICIPANT_ALIASES,
+                    {"participant", "text_id", "word_number", "response"},
+                    "participant cloze file")
+    out = pd.DataFrame({
+        "participant": df[cols["participant"]].astype(str).str.strip(),
+        "text_id": pd.to_numeric(df[cols["text_id"]], errors="coerce"),
+        "word_number": pd.to_numeric(df[cols["word_number"]], errors="coerce"),
+        "response": df[cols["response"]].astype(str).str.strip(),
+    })
+    n0 = len(out)
+    out = out.dropna(subset=["text_id", "word_number"])
+    out = out[out["response"] != ""]
+    out["text_id"] = out["text_id"].astype(int)
+    out["word_number"] = out["word_number"].astype(int)
+    dup = out.duplicated(["participant", "text_id", "word_number"]).sum()
+    out = out.drop_duplicates(["participant", "text_id", "word_number"], keep="first")
+    log.info("participant cloze file %s: %d rows, %d dropped as empty or unkeyed, "
+             "%d duplicate answers dropped, %d participants",
+             path, n0, n0 - len(out) - int(dup), int(dup), out["participant"].nunique())
+    return out.reset_index(drop=True), enc

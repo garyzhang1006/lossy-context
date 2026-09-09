@@ -4,6 +4,7 @@
 #   bash slurm/pipeline.sh
 #   N_REP=20 N_BOOT=20 E2_SHARDS=2 E3_SHARDS=2 E3_BOOT_SHARDS=2 E4_SHARDS=2 bash slurm/pipeline.sh
 #   LCSA_KERNEL=linear bash slurm/pipeline.sh robustness   # after the registered run
+#   LCSA_PARTICIPANTS=/path/to/cloze_by_participant.csv bash slurm/pipeline.sh   # adds E5
 #
 # Shard counts come from slurm/env.sh and override the --array lines in the
 # scripts, so the registered run and a smoke pass use the same files.  The
@@ -29,6 +30,7 @@ fi
 BUILD=$(jid slurm/build.sbatch);                                     echo "build      $BUILD"
 REFS=$(jid --dependency=afterok:$BUILD slurm/build_refs.sbatch);      echo "refs       $REFS"
 E1=$(jid --dependency=afterok:$BUILD slurm/e1.sbatch);                echo "e1         $E1"
+REL=$(jid --dependency=afterok:$BUILD slurm/reliability.sbatch);      echo "reliability $REL"
 LAD=$(jid --dependency=afterok:$REFS slurm/e2_ladder.sbatch);         echo "e2 ladder  $LAD"
 COV=$(jid --dependency=afterok:$LAD --array=0-$((E2_SHARDS - 1)) slurm/e2_cov.sbatch)
 echo "e2 cov     $COV"
@@ -42,6 +44,22 @@ CONF=$(jid --dependency=afterok:$REFS slurm/confounds.sbatch);       echo "confo
 SW=$(jid --dependency=afterok:$REFS:$PREP slurm/e4_sweep.sbatch);     echo "e4 sweep   $SW"
 BOOT=$(jid --dependency=afterok:$REFS:$PREP --array=0-$((E4_SHARDS - 1)) slurm/e4_boot.sbatch)
 echo "e4 boot    $BOOT"
-MERGE=$(jid --dependency=afterok:$COV:$REPS:$HUM:$SELF:$CONF:$SW:$BOOT slurm/merge.sbatch)
-echo "merge      $MERGE"
+PANEL=$(jid --dependency=afterok:$PREP:$LAD --array=0-$((E6_SHARDS - 1)) slurm/e6_crossed.sbatch)
+echo "e6 panel   $PANEL"
+read -ra SWEEPREFS <<< "$LCSA_SWEEP_REFS"
+SWEEP=$(jid --dependency=afterok:$BUILD --array=0-$(( ${#SWEEPREFS[@]} - 1 )) slurm/refsweep.sbatch)
+echo "refsweep   $SWEEP"
+LEGS=e2,e3,e4,e6
+DEPS=$E1:$REL:$COV:$REPS:$HUM:$SELF:$CONF:$SW:$BOOT:$PANEL:$SWEEP
+# E5 needs the per-participant cloze export, which the distributed norms do not
+# carry; without it the leg is skipped here instead of failing the chain.
+if [ -n "${LCSA_PARTICIPANTS:-}" ] && [ -f "$LCSA_PARTICIPANTS" ]; then
+    PART=$(jid --dependency=afterok:$PREP --array=0-$E5_SHARDS slurm/e5_participants.sbatch)
+    echo "e5 partic  $PART"
+    LEGS=$LEGS,e5; DEPS=$DEPS:$PART
+else
+    echo "e5 skipped: set LCSA_PARTICIPANTS to the per-participant cloze file to run it"
+fi
+MERGE=$(MERGE_LEGS=$LEGS jid --dependency=afterok:$DEPS slurm/merge.sbatch)
+echo "merge      $MERGE  (legs $LEGS)"
 echo "watch with: squeue -u \$USER ; logs under $LCSA_ROOT/logs"

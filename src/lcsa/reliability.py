@@ -241,16 +241,30 @@ def spearman_brown(r: float, k: float = 2.0) -> float:
 
 
 def split_half_reliability(
-    values: np.ndarray, groups: np.ndarray, seed: int = 0, n_splits: int = 50
+    values: np.ndarray, groups: np.ndarray, seed: int = 0, n_splits: int = 50,
+    participants: np.ndarray | None = None,
 ) -> float:
-    """Spearman-Brown corrected split-half correlation of per-item means."""
+    """Spearman-Brown corrected split-half correlation of per-item means.
+
+    With ``participants`` the halves are halves of the participant set, which
+    is the registered form for gaze (84 readers into two groups of 42); without
+    it each observation is assigned to a half independently.
+    """
     rng = np.random.default_rng(seed)
     values = np.asarray(values, dtype=np.float64)
     groups = np.asarray(groups)
     uniq, inv = np.unique(groups, return_inverse=True)
+    if participants is not None:
+        pu, pinv = np.unique(np.asarray(participants), return_inverse=True)
+        if pu.size < 2:
+            return float("nan")
     rs = []
     for _ in range(n_splits):
-        pick = rng.random(values.size) < 0.5
+        if participants is not None:
+            half = rng.permutation(pu.size) < pu.size // 2
+            pick = half[pinv]
+        else:
+            pick = rng.random(values.size) < 0.5
         a = np.bincount(inv[pick], weights=values[pick], minlength=uniq.size)
         na = np.bincount(inv[pick], minlength=uniq.size)
         b = np.bincount(inv[~pick], weights=values[~pick], minlength=uniq.size)

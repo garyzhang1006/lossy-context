@@ -445,6 +445,29 @@ def cmd_confounds(args) -> int:
     return 0
 
 
+def cmd_reliability(args) -> int:
+    from lcsa.data.provo import load_provo
+    from lcsa.experiments.reliability_stage import run
+
+    corpus = _load(args)
+    provo = None
+    if args.provo_dir:
+        provo = load_provo(args.provo_dir, require_eye=not args.no_eye)
+    rec = run(corpus, provo, args.out, seed=args.seed, n_splits=args.n_splits,
+              n_sim=args.n_sim)
+    _print({"g3_passed": rec["g3"].passed, "measured": rec["g3"].measured})
+    return 0
+
+
+def cmd_gates(args) -> int:
+    from lcsa.experiments.gates_table import collect
+
+    rows = collect(args.out, args.build, gpu_hours=args.gpu_hours,
+                   e3_complete=not args.e3_incomplete)
+    _print([{k: r.get(k) for k in ("gate", "passed", "source")} for r in rows])
+    return 0
+
+
 def cmd_manifest(args) -> int:
     from lcsa.manifest import check_manifest, write_manifest
 
@@ -454,6 +477,76 @@ def cmd_manifest(args) -> int:
         return 0 if rep["ok"] else 1
     rec = write_manifest(args.out, args.name)
     _print({"manifest": str(Path(args.out) / args.name), "n_files": rec["n_files"]})
+    return 0
+
+
+def cmd_e5(args) -> int:
+    from lcsa.data.provo import load_cloze_participants
+    from lcsa.experiments import e5_participants as e5
+
+    corpus = _load(args)
+    models = _models(args.estimators)
+    kernel = _kernel(args)
+    frame, enc = load_cloze_participants(args.participants)
+    keys = _read_keys(Path(args.targets))
+    words = json.loads(Path(args.candidates).read_text())
+    counts = e5.participant_counts(corpus, keys, words, frame)
+    if not counts:
+        raise SystemExit(f"no participant in {args.participants} reaches {e5.MIN_TARGETS} "
+                         "scored targets; check that its keys match targets.csv")
+    prepared = None
+    if args.e3_out:
+        from lcsa.experiments.e3_nulls import load_prepared
+        prepared = load_prepared(args.e3_out, corpus)
+    external = None
+    if args.external:
+        import pandas as pd
+        ext = pd.read_csv(args.external)
+        external = dict(zip(ext["participant"].astype(str), ext["delta"].astype(float)))
+    theta_path = Path(args.out) / "e5_theta_pooled.json"
+    if args.stage in ("all", "pooled"):
+        theta = e5.pooled_theta(corpus, models, kernel, args.seed)
+        theta_path.parent.mkdir(parents=True, exist_ok=True)
+        theta_path.write_text(json.dumps(theta))
+        if args.stage == "pooled":
+            _print({"stage": "pooled", "participants": len(counts), "theta": theta})
+            return 0
+    else:
+        if not theta_path.exists():
+            raise SystemExit(f"{theta_path} is missing; run `lcsa e5 --stage pooled` first")
+        theta = json.loads(theta_path.read_text())
+    if args.stage == "all":
+        res = e5.run(corpus, counts, models, args.out, prepared, kernel, args.seed, external)
+        _print({"participants": len(counts), "summary": res["summary"]})
+        return 0
+    reps = _rep_range(args, len(counts))
+    rows = e5.run_shard(corpus, counts, theta, models, args.out, reps, prepared, kernel, args.seed)
+    _print({"stage": "fits", "participants": [reps.start, reps.stop], "rows": len(rows),
+            "failed": sum(1 for r in rows if r.get("failed"))})
+    return 0
+
+
+def cmd_e6(args) -> int:
+    from lcsa.experiments import e6_crossed as e6
+    from lcsa.experiments.e3_nulls import load_prepared
+
+    corpus = _load(args)
+    models = _models(args.estimators)
+    kernel = _kernel(args)
+    prepared = load_prepared(args.e3_out or args.out, corpus)
+    theta_path = Path(args.out) / "e2_theta0.json"
+    if not theta_path.exists():
+        raise SystemExit(f"{theta_path} is missing; run `lcsa e2 --stage ladder` first")
+    theta0 = np.asarray(json.loads(theta_path.read_text())["theta0"], dtype=np.float64)
+    rungs = tuple(float(x) for x in args.rungs.split(","))
+    if args.stage == "all":
+        res = e6.run(corpus, theta0, prepared, models, args.out, kernel, args.n_rep, args.seed, rungs)
+        _print(res["panel"])
+        return 0
+    reps = _rep_range(args, args.n_rep)
+    rows = e6.run_shard(corpus, theta0, prepared, models, args.out, reps, kernel, args.seed, rungs)
+    _print({"stage": "panel", "replicates": [reps.start, reps.stop], "rows": len(rows),
+            "failed": sum(1 for r in rows if r.get("failed"))})
     return 0
 
 
@@ -479,8 +572,16 @@ def cmd_merge(args) -> int:
 
             res = merge(args.out)
             out["e4"] = {"selected_k": res["selected"], "prediction_8": res["prediction_8"]}
+        elif leg == "e5":
+            from lcsa.experiments.e5_participants import merge
+
+            out["e5"] = merge(args.out)["summary"]
+        elif leg == "e6":
+            from lcsa.experiments.e6_crossed import merge
+
+            out["e6"] = merge(args.out)["panel"]
         else:
-            raise SystemExit(f"unknown leg {leg!r}; choose from e2, e3, e4")
+            raise SystemExit(f"unknown leg {leg!r}; choose from e2, e3, e4, e5, e6")
     _print(out)
     return 0
 
@@ -530,7 +631,7 @@ def cmd_selftest(args) -> int:
 
     th0 = fit_constrained(corpus, NAIVE, n_starts=2, seed=args.seed).theta
     r2 = run_e2(corpus, corpus, th0, [NAIVE], out / "e2", n_rep=args.n_rep,
-                coverage_rungs=(8.0,), seed=args.seed)
+                coverage_rungs=(8.0, 16.0), seed=args.seed)
     r3 = run_e3(corpus, [NAIVE, REPAIRED], out / "e3",
                 h_specs={"N-LEX": h_lexical(corpus, REPAIRED, seed=args.seed)},
                 n_rep=args.n_rep, n_boot=args.n_boot, seed=args.seed)
@@ -543,7 +644,8 @@ def cmd_selftest(args) -> int:
 
     summary = {
         "e1_exactness": r1["exactness"]["passed"],
-        "e1_residual_fraction_naive": r1["residual_fraction"][0]["residual_fraction"],
+        "e1_residual_fraction_naive": r1["residual_fraction"][0]["residual_fraction_global"],
+        "e3_reading_rule": r3["human"]["reading_rule"]["verdict"] if r3.get("human") else None,
         "e2_coverage": r2["g6"].measured["coverage"],
         "e3_floor_rates": r3["g5"].measured["rates"],
         "e3_human_delta": [x["delta_hat"] for x in r3["human"]["fits"]],
@@ -645,6 +747,30 @@ def build_parser() -> argparse.ArgumentParser:
     shard(e4, "boot", "argmax bootstrap replicate")
     e4.set_defaults(func=cmd_e4)
 
+    e5 = sub.add_parser("e5", help="participant audit: per-reader half-lives and reliability")
+    common(e5)
+    e5.add_argument("--participants", required=True,
+                    help="per-participant cloze responses (participant, text_id, word_number, response)")
+    e5.add_argument("--targets", default="artifacts/build/targets.csv")
+    e5.add_argument("--candidates", default="artifacts/build/candidates.json")
+    e5.add_argument("--e3-out", default=None,
+                    help="an E3 output directory whose prepared tilts give the alignments")
+    e5.add_argument("--external", default=None,
+                    help="csv of external per-participant fits with columns participant, delta")
+    e5.add_argument("--stage", choices=["all", "pooled", "fits"], default="all")
+    shard(e5, "rep", "participant (by sorted position)")
+    e5.set_defaults(func=cmd_e5)
+
+    e6 = sub.add_parser("e6", help="crossed panel: known decay plus the N-ORDER mismatch")
+    common(e6)
+    e6.add_argument("--n-rep", type=int, default=200)
+    e6.add_argument("--rungs", default="4,8,16", help="comma list of true d_half values")
+    e6.add_argument("--e3-out", default=None,
+                    help="the E3 output directory with the prepared N-ORDER tilt; default --out")
+    e6.add_argument("--stage", choices=["all", "panel"], default="all")
+    shard(e6, "rep", "panel replicate")
+    e6.set_defaults(func=cmd_e6)
+
     cf = sub.add_parser("confounds", help="competence confounds: fits with perplexity")
     cf.add_argument("--reference", action="append", required=True, metavar="NAME=DIR",
                     help="a build directory with cache.npz and perplexity.json; repeatable")
@@ -657,6 +783,25 @@ def build_parser() -> argparse.ArgumentParser:
     cf.add_argument("--kernel", choices=["power", "linear"], default="power")
     cf.set_defaults(func=cmd_confounds)
 
+    rl = sub.add_parser("reliability", help="G3: debiased split-half JS and gaze reliability")
+    rl.add_argument("--cache", default="artifacts/build/cache.npz")
+    rl.add_argument("--out", default="artifacts")
+    rl.add_argument("--provo-dir", default=None, help="Provo directory with the eye-tracking file")
+    rl.add_argument("--no-eye", action="store_true", help="the cloze phenotype alone")
+    rl.add_argument("--n-splits", type=int, default=20)
+    rl.add_argument("--n-sim", type=int, default=20)
+    rl.add_argument("--seed", type=int, default=0)
+    rl.set_defaults(func=cmd_reliability)
+
+    gt = sub.add_parser("gates", help="collect G0 to G7 into gates.csv")
+    gt.add_argument("--out", default="artifacts")
+    gt.add_argument("--build", default=None, help="build directory holding g0_cache.json and g1.json")
+    gt.add_argument("--gpu-hours", type=float, default=None,
+                    help="audited GPU-hours so far, for G7; from sacct on the cluster")
+    gt.add_argument("--e3-incomplete", action="store_true",
+                    help="the nulls have not finished, so G7 applies its checkpoint")
+    gt.set_defaults(func=cmd_gates)
+
     mf = sub.add_parser("manifest", help="sha256 of every artifact, or check one")
     mf.add_argument("--out", default="artifacts")
     mf.add_argument("--name", default="manifest.json")
@@ -666,7 +811,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     mg = sub.add_parser("merge", help="combine shards into the registered tables")
     mg.add_argument("--out", default="artifacts")
-    mg.add_argument("--legs", default="e2,e3,e4")
+    mg.add_argument("--legs", default="e2,e3,e4",
+                    help="comma list from e2,e3,e4,e5,e6")
     mg.add_argument("--estimators", nargs="+", default=["naive", "repaired"])
     mg.add_argument("--margin", type=float, default=0.25, help="TOST margin for E3")
     mg.set_defaults(func=cmd_merge)
