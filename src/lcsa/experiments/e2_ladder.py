@@ -367,7 +367,7 @@ def assemble(ladder_rows: list[dict], coverage_rows: list[dict], models, out_dir
     return res
 
 
-def merge(out_dir, models, coverage_rungs=(4.0, 8.0)) -> dict:
+def merge(out_dir, models, coverage_rungs=(4.0, 8.0), n_rep: int | None = None) -> dict:
     """Combine ``e2_ladder.json`` and the coverage shards into the registered tables."""
     import json
     from pathlib import Path
@@ -376,7 +376,7 @@ def merge(out_dir, models, coverage_rungs=(4.0, 8.0)) -> dict:
     if not p.exists():
         raise FileNotFoundError(f"{p} is missing; run `lcsa e2 --stage ladder` first")
     ladder = denull(json.loads(p.read_text()))
-    return assemble(ladder, read_shards(out_dir, "e2_coverage"), models, out_dir,
+    return assemble(ladder, read_shards(out_dir, "e2_coverage", n_rep), models, out_dir,
                     coverage_rungs)
 
 

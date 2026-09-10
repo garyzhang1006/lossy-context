@@ -83,7 +83,8 @@ def cmd_build(args) -> int:
     if unigrams.source == "uniform":
         log.warning("SUBTLEX not supplied: the unigram channel is a uniform stand-in "
                     "and every result carries that label")
-    scorer = ReferenceScorer(args.model, dtype=args.dtype)
+    scorer = ReferenceScorer(args.model, dtype=args.dtype, max_batch_tokens=args.max_batch_tokens)
+    scorer.memory_preflight(n_rows=args.max_candidates // 2)
     log.info("reference %s on %s, forward path %s", args.model, scorer.device,
              scorer.resolve_path())
 
@@ -287,6 +288,7 @@ def _e3_h_specs(args, corpus) -> dict:
         contexts = [context_string(provo.passages[int(t)], int(w) - 1, None)
                     for t, w in keys]
         scorer = ReferenceScorer(args.model, dtype=args.dtype)
+        scorer.memory_preflight()
         if "topic" in wanted:
             h_specs["N-TOPIC"] = build_h_topic(corpus, words, contexts, scorer)
         if "order" in wanted:
@@ -550,27 +552,81 @@ def cmd_e6(args) -> int:
     return 0
 
 
+def cmd_register(args) -> int:
+    """Freeze the design, the predictions and the reading rule before any leg runs."""
+    from lcsa.registration import build_registration, check_constants, load_registration, write_registration
+
+    if args.check:
+        reg, h = load_registration(args.out)
+        drift = check_constants(reg)
+        _print({"registration": str(Path(args.out) / "registration.json"), "sha256": h,
+                "frozen_at": reg["frozen_at"], "drift": drift})
+        return 1 if drift else 0
+    shards = {k: int(v) for k, v in (kv.split("=", 1) for kv in (args.shards or []))}
+    reg = build_registration(
+        n_rep=args.n_rep, n_boot=args.n_boot, seed=args.seed, readers=args.readers,
+        kernel=args.kernel, model=args.model, references=args.references or (),
+        sweep_references=args.sweep_references or (), legs=args.legs.split(","), shards=shards)
+    p, h = write_registration(args.out, reg, force=args.force)
+    _print({"registration": str(p), "sha256": h, "frozen_at": reg["frozen_at"],
+            "n_rep": reg["design"]["n_rep"], "n_boot": reg["design"]["n_boot"],
+            "legs": reg["design"]["legs"], "n_predictions": len(reg["predictions"])})
+    return 0
+
+
 def cmd_merge(args) -> int:
-    """Combine the stage outputs and shards of each leg into the registered tables."""
+    """Combine the stage outputs and shards of each leg into the registered tables.
+
+    The registered form reads ``registration.json``, refuses drift in the file
+    or in the code constants it froze, refuses a registered leg whose artifacts
+    are absent, checks every shard tiling against the frozen replicate count,
+    and writes the scorecard from the frozen thresholds.  ``--unregistered``
+    skips all of that for an exploratory directory and says so in the output.
+    """
+    from lcsa.registration import (check_constants, load_registration, missing_artifacts,
+                                   score, write_scorecard)
+
     legs = [x.strip().lower() for x in args.legs.split(",") if x.strip()]
     models = _models(args.estimators)
+    reg = None
+    n_rep = n_boot = None
+    if not args.unregistered:
+        reg, h = load_registration(args.out)
+        drift = check_constants(reg)
+        if drift:
+            raise SystemExit("the code no longer matches the frozen registration:\n  " + "\n  ".join(drift))
+        n_rep, n_boot = reg["design"]["n_rep"], reg["design"]["n_boot"]
+        registered = [x for x in reg["design"]["legs"] if x != "e1"]
+        waived = set(x.strip().lower() for x in (args.allow_missing or "").split(",") if x.strip())
+        forgotten = [x for x in registered if x not in legs and x not in waived]
+        if forgotten:
+            raise SystemExit(
+                f"legs {forgotten} are registered but not being merged; pass them in --legs, or "
+                f"name them in --allow-missing to record that they did not run")
+        gone = missing_artifacts(args.out, [x for x in reg["design"]["legs"] if x not in waived])
+        if gone:
+            lines = [f"{leg}: {', '.join(pats)}" for leg, pats in gone.items()]
+            raise SystemExit("registered legs with missing artifacts under "
+                             f"{args.out}:\n  " + "\n  ".join(lines))
+        legs = [x for x in legs if x not in waived]
     out = {}
     for leg in legs:
         if leg == "e2":
             from lcsa.experiments.e2_ladder import merge
 
-            res = merge(args.out, models)
+            res = merge(args.out, models, n_rep=n_rep)
             out["e2"] = {"g6_passed": res["g6"].passed, "coverage": res["g6"].measured}
         elif leg == "e3":
             from lcsa.experiments.e3_nulls import merge
 
-            res = merge(args.out, margin=args.margin)
+            res = merge(args.out, margin=args.margin, n_rep=n_rep, n_boot=n_boot,
+                        require_human=reg is not None)
             out["e3"] = {"g5_passed": res["g5"].passed,
                          "human": None if res["human"] is None else res["human"]["g4"]}
         elif leg == "e4":
             from lcsa.experiments.e4_reading import merge
 
-            res = merge(args.out)
+            res = merge(args.out, n_boot=n_boot)
             out["e4"] = {"selected_k": res["selected"], "prediction_8": res["prediction_8"]}
         elif leg == "e5":
             from lcsa.experiments.e5_participants import merge
@@ -579,9 +635,21 @@ def cmd_merge(args) -> int:
         elif leg == "e6":
             from lcsa.experiments.e6_crossed import merge
 
-            out["e6"] = merge(args.out)["panel"]
+            out["e6"] = merge(args.out, n_rep=n_rep)["panel"]
         else:
             raise SystemExit(f"unknown leg {leg!r}; choose from e2, e3, e4, e5, e6")
+    if reg is not None:
+        card = score(reg, args.out)
+        for leg in waived:
+            for row in card["predictions"]:
+                if row["leg"] == leg:
+                    row["status"] = "not run"
+        p = write_scorecard(args.out, card)
+        out["scorecard"] = {"path": str(p), "registration_sha256": card["registration_sha256"],
+                            "status": {r["id"]: r["status"] for r in card["predictions"]},
+                            "reading_rule": card["reading_rule"]["status"]}
+    else:
+        out["scorecard"] = "not written: --unregistered merges carry no scorecard"
     _print(out)
     return 0
 
@@ -676,6 +744,9 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--max-depth", type=int, default=32)
     b.add_argument("--max-candidates", type=int, default=120)
     b.add_argument("--top-k", type=int, default=50)
+    b.add_argument("--max-batch-tokens", type=int, default=16384,
+                   help="token budget per forward on the reference path; the logits, not the "
+                        "weights, set the GPU memory a build needs")
     b.add_argument("--no-eye", action="store_true", help="skip the eye-tracking arm")
     b.add_argument("--force", action="store_true", help="build even if G0 fails")
     b.add_argument("--candidates", default=None,
@@ -809,8 +880,30 @@ def build_parser() -> argparse.ArgumentParser:
                     help="compare the directory against the manifest; exit 1 on drift")
     mf.set_defaults(func=cmd_manifest)
 
+    rg = sub.add_parser("register", help="freeze the design and predictions before any leg runs")
+    rg.add_argument("--out", default="artifacts")
+    rg.add_argument("--n-rep", type=int, default=200)
+    rg.add_argument("--n-boot", type=int, default=200)
+    rg.add_argument("--seed", type=int, default=0)
+    rg.add_argument("--kernel", choices=["power", "linear"], default="power")
+    rg.add_argument("--model", default="Qwen/Qwen2.5-1.5B")
+    rg.add_argument("--readers", nargs="+", default=None)
+    rg.add_argument("--references", nargs="*", default=None)
+    rg.add_argument("--sweep-references", nargs="*", default=None)
+    rg.add_argument("--legs", default="e1,e2,e3,e4,e6", help="comma list of legs the run must produce")
+    rg.add_argument("--shards", nargs="*", default=None, metavar="LEG=N",
+                    help="array sizes, recorded so the tiling is part of the frozen plan")
+    rg.add_argument("--force", action="store_true", help="overwrite an existing registration")
+    rg.add_argument("--check", action="store_true",
+                    help="verify the hash and that the code constants still match; exit 1 on drift")
+    rg.set_defaults(func=cmd_register)
+
     mg = sub.add_parser("merge", help="combine shards into the registered tables")
     mg.add_argument("--out", default="artifacts")
+    mg.add_argument("--unregistered", action="store_true",
+                    help="merge without registration.json; no scorecard, no count checks")
+    mg.add_argument("--allow-missing", default=None, metavar="LEGS",
+                    help="registered legs recorded as 'not run' instead of failing the merge")
     mg.add_argument("--legs", default="e2,e3,e4",
                     help="comma list from e2,e3,e4,e5,e6")
     mg.add_argument("--estimators", nargs="+", default=["naive", "repaired"])

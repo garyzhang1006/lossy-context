@@ -6,10 +6,15 @@
 #   sbatch --dependency=afterok:<lcsa-build id> slurm/build_refs.sbatch
 #
 # GPT-2-large (774M) is the largest of the three, so a run is at most the primary
-# build's cost and the limit stays far under scu-gpu's two-day ceiling.
+# build's cost and the limit stays far under scu-gpu's two-day ceiling.  The
+# card is pinned to an L40S all the same: what fills a GPU here is the logits
+# tensor, tokens times vocabulary, and not the weights, so "any GPU holds a
+# small model" is the assumption that put the seed-noise build out of memory
+# on a 22 GB Quadro.  `lcsa build` prints the estimate and refuses a card that
+# cannot hold it.
 #SBATCH --job-name=lcsa-refs
 #SBATCH --partition=scu-gpu
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:l40s:1
 #SBATCH --array=0-2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48000M
@@ -26,6 +31,7 @@ read -ra REFS <<< "$LCSA_REFS"
 MODEL="${REFS[$SLURM_ARRAY_TASK_ID]}"
 OUT=$(ref_dir "$MODEL")
 if [ -f "$OUT/cache.npz" ]; then echo "$OUT/cache.npz exists; remove it to rebuild"; exit 0; fi
+require_prefetched "$MODEL"
 python -c 'import torch; assert torch.cuda.is_available(), "no CUDA device visible"'
 lcsa --verbose build --provo-dir "$LCSA_PROVO" --subtlex "$LCSA_SUBTLEX" \
     --model "$MODEL" --out "$OUT" --max-depth 32 \

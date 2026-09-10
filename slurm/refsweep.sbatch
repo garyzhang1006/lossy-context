@@ -9,9 +9,11 @@
 # Llama-3.1-8B and Qwen2.5-7B in float16 fit an L40S with the 32-depth cache
 # batched as in the primary build; budget about 12 GPU-hours each, the
 # Pythia pair under two together.  Set LCSA_SWEEP_REFS to change the list.
+# The card is pinned: the 8B weights alone are 16 GB, and the logits of one
+# forward add tokens times vocabulary on top, which a 22 GB card cannot hold.
 #SBATCH --job-name=lcsa-refsweep
 #SBATCH --partition=scu-gpu
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:l40s:1
 #SBATCH --array=0-3
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64000M
@@ -27,6 +29,7 @@ read -ra REFS <<< "$LCSA_SWEEP_REFS"
 MODEL="${REFS[$SLURM_ARRAY_TASK_ID]}"
 OUT=$(ref_dir "$MODEL")
 if [ ! -f "$OUT/cache.npz" ]; then
+    require_prefetched "$MODEL"
     python -c 'import torch; assert torch.cuda.is_available(), "no CUDA device visible"'
     lcsa --verbose build --provo-dir "$LCSA_PROVO" --subtlex "$LCSA_SUBTLEX" \
         --model "$MODEL" --out "$OUT" --max-depth 32 \

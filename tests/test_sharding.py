@@ -9,6 +9,7 @@ as stages plus shards, then compares the registered artifacts as bytes.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -186,7 +187,12 @@ def test_cli_stages_and_merge_reproduce_the_monolithic_commands(corpus, tmp_path
                  "--boot-stop", "3"]) == 0
     assert main(["e3", *c, "--out", sh, "--stage", "contrast", "--n-boot", "4",
                  "--boot-start", "3"]) == 0
+    assert main(["register", "--out", sh, "--n-rep", "3", "--n-boot", "4", "--legs", "e2,e3",
+                 "--readers", "N0", "N0-PRIME", "N-LEX"]) == 0
     assert main(["merge", "--out", sh, "--legs", "e2,e3"]) == 0
+    card = json.loads((Path(sh) / "scorecard.json").read_text())
+    assert {r["id"] for r in card["predictions"]} == set(range(1, 12))
+    assert card["registration_sha256"] == (Path(sh) / "registration.sha256").read_text().split()[0]
     _same(tmp_path / "mono", tmp_path / "sh",
           ["e2_summary.json", "e2_coverage.csv", "e3_summary.json",
            "e3_rejection_rates.csv", "e3_human.json"])

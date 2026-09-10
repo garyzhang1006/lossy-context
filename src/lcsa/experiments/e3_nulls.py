@@ -775,8 +775,14 @@ def assemble(
     return res
 
 
-def merge(out_dir, margin: float = 0.25, alpha: float = 0.05) -> dict:
-    """Combine the prepared stage, the rate shards and the human stage on disk."""
+def merge(out_dir, margin: float = 0.25, alpha: float = 0.05, n_rep: int | None = None,
+          n_boot: int | None = None, require_human: bool = False) -> dict:
+    """Combine the prepared stage, the rate shards and the human stage on disk.
+
+    ``require_human`` makes an absent human stage or contrast an error; the
+    registered merge passes it so that a leg the paper quotes cannot be missing
+    without the merge saying so.
+    """
     from pathlib import Path
 
     out = Path(out_dir)
@@ -788,14 +794,20 @@ def merge(out_dir, margin: float = 0.25, alpha: float = 0.05) -> dict:
                 "calibration": denull(meta["calibration"]), "readers": meta["readers"]}
     rate_rows = []
     for nm in meta["readers"]:
-        rate_rows += read_shards(out, f"e3_rates_{nm}")
+        rate_rows += read_shards(out, f"e3_rates_{nm}", n_rep)
     human = contrast = None
     if (out / "e3_human_stage.json").exists():
         human = denull(json.loads((out / "e3_human_stage.json").read_text()))
         try:
-            contrast = read_shards(out, "e3_contrast")
+            contrast = read_shards(out, "e3_contrast", n_boot)
         except FileNotFoundError:
+            if require_human:
+                raise
             contrast = None
+    elif require_human:
+        raise FileNotFoundError(
+            f"{out / 'e3_human_stage.json'} is missing; the human fit is registered, run "
+            "`lcsa e3 --stage human` (slurm/e3_human.sbatch task 0) before merging")
     return assemble(prepared, rate_rows, out, human, contrast, margin, alpha)
 
 

@@ -224,7 +224,9 @@ def test_e4_cli_stages_accept_a_frozen_reference_build(built, provo_dir, tmp_pat
     assert main([*args, "--stage", "sweep"]) == 0
     assert main([*args, "--stage", "boot", "--n-boot", "3", "--boot-stop", "2"]) == 0
     assert main([*args, "--stage", "boot", "--n-boot", "3", "--boot-start", "2"]) == 0
+    assert main(["register", "--out", str(out), "--n-boot", "3", "--legs", "e4"]) == 0
     assert main(["merge", "--out", str(out), "--legs", "e4", "--estimators", "naive"]) == 0
+    assert (out / "scorecard.csv").exists()
     res = json.loads((out / "e4_summary.json").read_text())
     assert res["selected"]["self"] == res["selected"]["primary"]
     assert res["argmax_bootstrap"]["self"]["n_boot"] == 3

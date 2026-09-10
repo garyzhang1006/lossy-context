@@ -392,9 +392,9 @@ def assemble(stage: dict, boot_rows: list[dict], out_dir) -> dict:
     return res
 
 
-def merge(out_dir) -> dict:
+def merge(out_dir, n_boot: int | None = None) -> dict:
     """Combine the sweep stage and the argmax shards on disk."""
-    return assemble(load_stage(out_dir), read_shards(out_dir, "e4_argmax"), out_dir)
+    return assemble(load_stage(out_dir), read_shards(out_dir, "e4_argmax", n_boot), out_dir)
 
 
 def run(

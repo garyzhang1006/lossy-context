@@ -138,8 +138,8 @@ def assemble(rows: list[dict], out_dir) -> dict:
     return res
 
 
-def merge(out_dir) -> dict:
-    return assemble(denull(read_shards(out_dir, "e6_panel")), out_dir)
+def merge(out_dir, n_rep: int | None = None) -> dict:
+    return assemble(denull(read_shards(out_dir, "e6_panel", n_rep)), out_dir)
 
 
 def run(corpus, theta_nuisance, prepared, models, out_dir, kernel=POWER, n_rep: int = 200,

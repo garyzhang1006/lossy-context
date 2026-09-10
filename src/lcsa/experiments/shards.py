@@ -57,13 +57,16 @@ def denull(obj):
     return math.nan if obj is None else obj
 
 
-def read_shards(out_dir, stem: str) -> list[dict]:
+def read_shards(out_dir, stem: str, n_required: int | None = None) -> list[dict]:
     """Concatenate every shard of ``stem`` and check that the ranges tile.
 
     Overlapping shards would double-count a replicate and a gap would silently
     report fewer replicates than were registered, so both are errors rather
-    than warnings.  Shards may extend past the registered count: the summariser
-    then reports the larger number and the first replicates are unchanged.
+    than warnings.  So is a tiling that stops short of ``n_required``, the
+    count the registration froze: an array whose last tasks never ran must
+    fail the merge, not shrink the table.  Shards may extend past the count,
+    in which case the summariser reports the larger number and the first
+    replicates are unchanged.
     """
     d = Path(out_dir) / SHARD_DIR
     files = sorted(d.glob(f"{stem}_*-*.json")) if d.is_dir() else []
@@ -82,4 +85,8 @@ def read_shards(out_dir, stem: str) -> list[dict]:
             raise ValueError(f"replicates [{e0}, {s1}) are missing between {n0} and {n1}")
     if spans[0][0] != 0:
         raise ValueError(f"the first shard {spans[0][2]} starts at {spans[0][0]}, not 0")
+    if n_required is not None and spans[-1][1] < int(n_required):
+        raise ValueError(
+            f"shards of {stem} cover replicates [0, {spans[-1][1]}) but {int(n_required)} were "
+            f"registered; replicates [{spans[-1][1]}, {int(n_required)}) never ran under {d}")
     return rows

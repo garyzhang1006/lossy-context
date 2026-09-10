@@ -3,7 +3,7 @@
 #
 # All output lives under ROOT on the Lustre scratch, mounted on login and compute
 # nodes alike.  /scu-storage03 is login-only and is never referenced.  The corpus
-# files are expected under $LCSA_DATA, which setup.sh creates and prefetch.sh checks.
+# files are expected under $LCSA_DATA, which setup.sbatch creates and prefetch.sbatch checks.
 
 export LCSA_ROOT="${LCSA_ROOT:-/athena/accardilab/scratch/$USER/lossy-context}"
 export LCSA_VENV="${LCSA_VENV:-$LCSA_ROOT/venv}"
@@ -14,8 +14,6 @@ export LCSA_MODEL="${LCSA_MODEL:-Qwen/Qwen2.5-1.5B}"
 
 # One Hugging Face cache for both papers, on scratch rather than the NFS home.
 export HF_HOME="${HF_HOME:-/athena/accardilab/scratch/$USER/hf}"
-# Set to 1 when the compute nodes have no outbound network, after prefetch.sh.
-export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
 
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
@@ -25,12 +23,35 @@ export PYTHONUNBUFFERED=1
 
 mkdir -p "$LCSA_ROOT"/{build,smoke,artifacts,logs} "$LCSA_PROVO" "$HF_HOME"
 
-if [ -f "$LCSA_VENV/bin/activate" ]; then
+# The venv is activated only where its interpreter works.  Its python is a
+# symlink to /usr/bin/python3, which is 3.9.21 on every compute node and 3.6.8
+# on the login nodes, so sourcing this file on a login node used to activate a
+# venv whose first import died on `from __future__ import annotations`.  The
+# submit scripts only need the variables above and set LCSA_VARS_ONLY=1.
+if [ "${LCSA_VARS_ONLY:-0}" != 1 ]; then
+    if [ ! -f "$LCSA_VENV/bin/activate" ]; then
+        echo "no virtualenv at $LCSA_VENV; sbatch slurm/setup.sbatch first" >&2
+        exit 2
+    fi
     # shellcheck disable=SC1091
     . "$LCSA_VENV/bin/activate"
-else
-    echo "no virtualenv at $LCSA_VENV; run slurm/setup.sh on a login node first" >&2
-    exit 2
+    # Once slurm/prefetch.sbatch has written its marker every job runs offline,
+    # so that no GPU array task talks to the Hub: twenty-seven of them doing so
+    # at once from the cluster's shared address is how the seed-noise run
+    # collected HTTP 429s.  prefetch.sbatch exports 0 before sourcing this file.
+    # The flag is decided inside the job and not on the submit node, whose
+    # environment sbatch --export=ALL would otherwise carry in.
+    if [ -f "$HF_HOME/lcsa_prefetch.done" ]; then
+        export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+    else
+        export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
+    fi
+    export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-$HF_HUB_OFFLINE}"
+    if ! python -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
+        echo "the venv's python resolves to $(python --version 2>&1) on $(hostname); this is a login node." >&2
+        echo "lcsa needs 3.9+, which the compute nodes have: run this inside sbatch or srun --partition=scu-cpu." >&2
+        exit 2
+    fi
 fi
 
 # Registered replicate counts and the number of array tasks each loop is cut
@@ -65,3 +86,14 @@ shard_range() {
     echo "$start $stop"
 }
 ref_dir() { echo "$LCSA_ROOT/build_${1//\//_}"; }
+# require_prefetched MODEL... -> exit 1 unless prefetch.sbatch fetched each one.
+# GPU jobs call this before loading anything so that a checkpoint missing from
+# the cache fails at once with the fix named, instead of twenty tasks each
+# opening a connection to the Hub.
+require_prefetched() {
+    local marker="$HF_HOME/lcsa_prefetch.done" m
+    [ -f "$marker" ] || { echo "no $marker; sbatch slurm/prefetch.sbatch before any GPU job" >&2; exit 1; }
+    for m in "$@"; do
+        grep -qxF "$m" "$marker" || { echo "$m is not in $marker; add it to the env lists and resubmit slurm/prefetch.sbatch" >&2; exit 1; }
+    done
+}

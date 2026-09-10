@@ -12,13 +12,17 @@
 # caches, into artifacts_linear, which is the Kuribayashi appendix table.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-. slurm/env.sh
+# This runs on a login node, whose python cannot run the venv, so env.sh is
+# sourced for its variables alone; every job activates the venv itself.
+LCSA_VARS_ONLY=1 . slurm/env.sh
+[ -f "$LCSA_VENV/bin/activate" ] || { echo "no venv at $LCSA_VENV; sbatch slurm/setup.sbatch and wait for it first" >&2; exit 2; }
 read -ra READERS <<< "$E3_READERS"
 jid() { sbatch --parsable --export=ALL "$@" | cut -d';' -f1; }
 if [ "${1:-}" = robustness ]; then
     [ "$LCSA_KERNEL" != power ] || { echo "robustness needs LCSA_KERNEL=linear" >&2; exit 2; }
     [ -f "$LCSA_ROOT/build/cache.npz" ] || { echo "no primary cache; run the registered pipeline first" >&2; exit 1; }
-    PREP=$(jid slurm/e3_prepare.sbatch);                               echo "e3 prepare $PREP"
+    REG=$(REGISTER_LEGS=e3 jid slurm/register.sbatch);                 echo "register   $REG  (into $LCSA_ART)"
+    PREP=$(jid --dependency=afterok:$REG slurm/e3_prepare.sbatch);      echo "e3 prepare $PREP"
     REPS=$(jid --dependency=afterok:$PREP --array=0-$(( ${#READERS[@]} * E3_SHARDS - 1 )) slurm/e3_reps.sbatch)
     echo "e3 reps    $REPS"
     HUM=$(jid --dependency=afterok:$PREP --array=0-$E3_BOOT_SHARDS slurm/e3_human.sbatch)
@@ -27,7 +31,14 @@ if [ "${1:-}" = robustness ]; then
     echo "merge      $MERGE  (into $LCSA_ART)"
     exit 0
 fi
-BUILD=$(jid slurm/build.sbatch);                                     echo "build      $BUILD"
+# The two jobs every other one waits on: the sequential checkpoint download
+# and the frozen registration.  Both are cheap to repeat and neither touches a
+# result, so they run at the head of every submission.
+PRE=$(jid slurm/prefetch.sbatch);                                    echo "prefetch   $PRE"
+REGLEGS=e1,e2,e3,e4,e6
+if [ -n "${LCSA_PARTICIPANTS:-}" ] && [ -f "$LCSA_PARTICIPANTS" ]; then REGLEGS=$REGLEGS,e5; fi
+REG=$(REGISTER_LEGS=$REGLEGS jid slurm/register.sbatch);              echo "register   $REG  (legs $REGLEGS)"
+BUILD=$(jid --dependency=afterok:$PRE:$REG slurm/build.sbatch);       echo "build      $BUILD"
 REFS=$(jid --dependency=afterok:$BUILD slurm/build_refs.sbatch);      echo "refs       $REFS"
 E1=$(jid --dependency=afterok:$BUILD slurm/e1.sbatch);                echo "e1         $E1"
 REL=$(jid --dependency=afterok:$BUILD slurm/reliability.sbatch);      echo "reliability $REL"

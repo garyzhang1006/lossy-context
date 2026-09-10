@@ -105,6 +105,7 @@ class ReferenceScorer:
         model=None,
         tokenizer=None,
         max_prefix_tokens: int = 1024,
+        max_batch_tokens: int = 16384,
     ) -> None:
         import torch  # imported lazily so the CPU-only estimation path needs no torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -133,12 +134,72 @@ class ReferenceScorer:
         for p in self.model.parameters():
             p.requires_grad_(False)
         self.max_prefix_tokens = int(max_prefix_tokens)
+        # The reference path forwards every trie node as its own row, so a
+        # 120-type candidate set is about sixty rows of up to 1,025 tokens.  The
+        # model returns logits for every position of every row unless told
+        # otherwise, and that tensor, not the weights, is what runs a 22 GB card
+        # out of memory: 60 x 1025 x 152k x 2 bytes is 18.7 GB before the cast
+        # to float32.  Rows are therefore forwarded in chunks under this token
+        # budget with ``logits_to_keep=1`` where the model accepts it.
+        self.max_batch_tokens = int(max_batch_tokens)
+        self._logits_to_keep_ok = None
         self.path = path
         self._resolved = None
         # G1 is priced as 2N FLOP per parameter per token forwarded, so the
         # scorer counts tokens across every path and exposes N.
         self.n_params = int(sum(p.numel() for p in self.model.parameters()))
+        head = getattr(self.model, "get_output_embeddings", lambda: None)()
+        if head is not None and hasattr(head, "weight"):
+            self.vocab_size = int(head.weight.shape[0])
+        else:
+            self.vocab_size = int(getattr(getattr(self.model, "config", None), "vocab_size", 0)
+                                  or getattr(self.tok, "vocab_size", 0) or 0)
         self.tokens_forwarded = 0
+
+    # -- memory ---------------------------------------------------------
+
+    def logits_bytes(self, tokens: int, kept: int | None = None) -> int:
+        """Bytes the logits of one forward occupy: the half-precision tensor the
+        model returns for ``tokens`` positions plus the float32 copy of the
+        ``kept`` rows that the log-softmax runs on."""
+        kept = tokens if kept is None else kept
+        elt = self.torch.finfo(self.dtype).bits // 8
+        return tokens * self.vocab_size * elt + kept * self.vocab_size * 4
+
+    def memory_preflight(self, n_rows: int = 64) -> dict:
+        """Estimate the peak logits allocation of each path against the device.
+
+        The estimate is what the seed-noise sbatch comment ("any GPU type holds
+        a 410M model") left out: the logits scale with tokens times vocabulary
+        and not with the parameter count.  Returns the figures and raises when
+        the packed path alone would not fit, so the job fails in its first
+        second with the card named instead of hours in with an OOM trace.
+        """
+        torch = self.torch
+        packed_tokens = self.max_prefix_tokens + 4 * n_rows
+        packed = self.logits_bytes(packed_tokens, kept=4 * n_rows)
+        chunk_rows = max(1, self.max_batch_tokens // (self.max_prefix_tokens + 8))
+        simple = self.logits_bytes(chunk_rows * (self.max_prefix_tokens + 8), kept=chunk_rows)
+        simple_all_positions = self.logits_bytes(chunk_rows * (self.max_prefix_tokens + 8))
+        weights = self.n_params * (torch.finfo(self.dtype).bits // 8)
+        rep = {"device": self.device, "vocab_size": self.vocab_size, "weights_bytes": weights,
+               "packed_logits_bytes": packed, "simple_chunk_logits_bytes": simple,
+               "simple_chunk_logits_bytes_without_logits_to_keep": simple_all_positions,
+               "chunk_rows": chunk_rows, "total_bytes": None, "name": None}
+        if self.device.startswith("cuda") and torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(torch.device(self.device))
+            rep["total_bytes"] = int(props.total_memory)
+            rep["name"] = props.name
+            need = weights + max(packed, simple_all_positions)
+            if need > 0.9 * props.total_memory:
+                raise RuntimeError(
+                    f"{props.name} has {props.total_memory / 2**30:.1f} GiB; weights "
+                    f"({weights / 2**30:.1f} GiB) plus the logits of one forward "
+                    f"({max(packed, simple_all_positions) / 2**30:.1f} GiB at vocabulary "
+                    f"{self.vocab_size}) exceed 90 percent of it; request a 40 GB+ card "
+                    "(--gres=gpu:l40s:1) or lower --max-batch-tokens")
+        log.info("memory preflight: %s", rep)
+        return rep
 
     # -- low level ------------------------------------------------------
 
@@ -189,6 +250,24 @@ class ReferenceScorer:
             raise ValueError(f"context {context[:40]!r} encoded to nothing")
         return ids[-self.max_prefix_tokens :]
 
+    def _last_logits(self, ids, att, pos):
+        """Logits at the final position only, asking the model to keep one row
+        where it supports ``logits_to_keep`` and slicing otherwise."""
+        torch = self.torch
+        with torch.no_grad():
+            if self._logits_to_keep_ok is not False:
+                try:
+                    out = self.model(input_ids=ids, attention_mask=att, position_ids=pos,
+                                     logits_to_keep=1).logits
+                    self._logits_to_keep_ok = True
+                    return out[:, -1, :]
+                except TypeError:
+                    self._logits_to_keep_ok = False
+                    log.warning("%s does not accept logits_to_keep; the reference path keeps "
+                                "every position's logits and needs the memory for it",
+                                self.model_name)
+            return self.model(input_ids=ids, attention_mask=att, position_ids=pos).logits[:, -1, :]
+
     def _simple_nodes(self, prefix_ids: list[int], trie: CandidateTrie) -> dict[int, np.ndarray]:
         torch = self.torch
         out: dict[int, np.ndarray] = {}
@@ -199,22 +278,23 @@ class ReferenceScorer:
             keys.append(node)
         maxlen = max(len(s) for s in batch)
         pad = int(self.tok.pad_token_id)
-        ids = torch.full((len(batch), maxlen), pad, dtype=torch.long, device=self.device)
-        att = torch.zeros((len(batch), maxlen), dtype=torch.long, device=self.device)
-        for r, s in enumerate(batch):
-            # Left padding keeps the final position at index maxlen-1 for all rows.
-            ids[r, maxlen - len(s) :] = torch.tensor(s, dtype=torch.long, device=self.device)
-            att[r, maxlen - len(s) :] = 1
-        # Explicit position ids are mandatory under left padding: the default is
-        # arange(maxlen), which would shift every short row's positions and make
-        # this "reference" path quietly wrong.
-        pos = (att.cumsum(dim=1) - 1).clamp(min=0)
-        self.tokens_forwarded += int(ids.numel())
-        with torch.no_grad():
-            logits = self.model(input_ids=ids, attention_mask=att, position_ids=pos).logits
-        lp = torch.log_softmax(logits[:, -1, :].float(), dim=-1).cpu().numpy()
-        for r, node in enumerate(keys):
-            out[node] = lp[r]
+        rows_per_chunk = max(1, self.max_batch_tokens // maxlen)
+        for start in range(0, len(batch), rows_per_chunk):
+            chunk = batch[start:start + rows_per_chunk]
+            ids = torch.full((len(chunk), maxlen), pad, dtype=torch.long, device=self.device)
+            att = torch.zeros((len(chunk), maxlen), dtype=torch.long, device=self.device)
+            for r, s in enumerate(chunk):
+                # Left padding keeps the final position at index maxlen-1 for all rows.
+                ids[r, maxlen - len(s) :] = torch.tensor(s, dtype=torch.long, device=self.device)
+                att[r, maxlen - len(s) :] = 1
+            # Explicit position ids are mandatory under left padding: the default is
+            # arange(maxlen), which would shift every short row's positions and make
+            # this "reference" path quietly wrong.
+            pos = (att.cumsum(dim=1) - 1).clamp(min=0)
+            self.tokens_forwarded += int(ids.numel())
+            lp = torch.log_softmax(self._last_logits(ids, att, pos).float(), dim=-1).cpu().numpy()
+            for r, node in enumerate(keys[start:start + rows_per_chunk]):
+                out[node] = lp[r]
         return out
 
     def _packed_nodes(self, prefix_ids: list[int], trie: CandidateTrie) -> dict[int, np.ndarray]:
@@ -228,8 +308,13 @@ class ReferenceScorer:
         self.tokens_forwarded += int(ii.numel())
         with torch.no_grad():
             logits = self.model(input_ids=ii, attention_mask=add, position_ids=pp).logits
-        lp = torch.log_softmax(logits[0].float(), dim=-1).cpu().numpy()
-        return {node: lp[rows[node]] for node in trie.eval_nodes}
+        # Only the evaluated nodes' rows are cast to float32 and normalised; the
+        # prefix positions are never read, and casting the whole sequence would
+        # double the largest allocation of the build for nothing.
+        keep = list(trie.eval_nodes)
+        idx = torch.tensor([rows[node] for node in keep], dtype=torch.long, device=self.device)
+        lp = torch.log_softmax(logits[0].index_select(0, idx).float(), dim=-1).cpu().numpy()
+        return {node: lp[k] for k, node in enumerate(keep)}
 
     # -- path selection -------------------------------------------------
 

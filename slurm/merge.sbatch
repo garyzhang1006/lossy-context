@@ -13,7 +13,13 @@ ENV="${LCSA_REPO:-$SLURM_SUBMIT_DIR}/slurm/env.sh"
 [ -f "$ENV" ] || { echo "submit from the repository root or export LCSA_REPO" >&2; exit 2; }
 . "$ENV"
 OUT="$LCSA_ART"
-lcsa merge --out "$OUT" --legs "${MERGE_LEGS:-e2,e3,e4,e6}"
+# The merge reads the frozen registration, refuses drift or a missing leg, and
+# writes scorecard.csv from the registered thresholds.  MERGE_ALLOW_MISSING
+# names legs recorded as "not run" on the scorecard, never silently dropped.
+lcsa register --out "$OUT" --check
+lcsa merge --out "$OUT" --legs "${MERGE_LEGS:-e2,e3,e4,e6}" \
+    ${MERGE_ALLOW_MISSING:+--allow-missing "$MERGE_ALLOW_MISSING"}
+cat "$OUT/scorecard.csv"
 for f in e2_coverage e3_rejection_rates confounds e6_panel e5_summary; do
     [ -f "$OUT/$f.csv" ] && cat "$OUT/$f.csv"
 done
