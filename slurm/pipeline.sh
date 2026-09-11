@@ -41,11 +41,20 @@ E3_BOOT_SHARDS $N_BOOT
 E4_SHARDS $N_BOOT
 E5_SHARDS $N_PART
 EOF
+# QOS normal caps this account at LCSA_MAX_RUNNING running jobs.  Slurm queues
+# the excess rather than refusing it, so this is a note about wall clock and
+# not an error; it is printed here because an array that sits in PENDING with
+# reason QOSMaxJobsPerUserLimit otherwise looks like a stuck chain.
+TASKS=$(( E2_SHARDS + ${#READERS[@]} * E3_SHARDS + E3_BOOT_SHARDS + 1 + E4_SHARDS + E6_SHARDS ))
+[ "$TASKS" -le "$LCSA_MAX_RUNNING" ] || echo \
+    "note: this chain submits $TASKS array tasks and QOS normal runs $LCSA_MAX_RUNNING at a time, so the rest wait with reason QOSMaxJobsPerUserLimit"
+
 if [ "${1:-}" = robustness ]; then
     [ "$LCSA_KERNEL" != power ] || { echo "robustness needs LCSA_KERNEL=linear" >&2; exit 2; }
     [ -f "$LCSA_ROOT/build/cache.npz" ] || { echo "no primary cache; run the registered pipeline first" >&2; exit 1; }
     REG=$(REGISTER_LEGS=e3 jid slurm/register.sbatch);                 echo "register   $REG  (into $LCSA_ART)"
-    PREP=$(jid --dependency=afterok:$REG slurm/e3_prepare.sbatch);      echo "e3 prepare $PREP"
+    PREP=$(jid --dependency=afterok:$REG --gres="$LCSA_GPU_GRES" slurm/e3_prepare.sbatch)
+    echo "e3 prepare $PREP  ($LCSA_GPU_GRES)"
     REPS=$(jid --dependency=afterok:$PREP --array=0-$(( ${#READERS[@]} * E3_SHARDS - 1 )) slurm/e3_reps.sbatch)
     echo "e3 reps    $REPS"
     HUM=$(jid --dependency=afterok:$PREP --array=0-$E3_BOOT_SHARDS slurm/e3_human.sbatch)
@@ -61,16 +70,18 @@ PRE=$(jid slurm/prefetch.sbatch);                                    echo "prefe
 REGLEGS=e1,e2,e3,e4,e6
 if [ -n "${LCSA_PARTICIPANTS:-}" ] && [ -f "$LCSA_PARTICIPANTS" ]; then REGLEGS=$REGLEGS,e5; fi
 REG=$(REGISTER_LEGS=$REGLEGS jid slurm/register.sbatch);              echo "register   $REG  (legs $REGLEGS)"
-BUILD=$(jid --dependency=afterok:$PRE:$REG slurm/build.sbatch);       echo "build      $BUILD"
+BUILD=$(jid --dependency=afterok:$PRE:$REG --gres="$LCSA_GPU_GRES" slurm/build.sbatch)
+echo "build      $BUILD  ($LCSA_GPU_GRES)"
 read -ra BREFS <<< "$LCSA_REFS"
-REFS=$(jid --dependency=afterok:$BUILD --array=0-$(( ${#BREFS[@]} - 1 )) slurm/build_refs.sbatch)
+REFS=$(jid --dependency=afterok:$BUILD --gres="$LCSA_GPU_GRES" --array=0-$(( ${#BREFS[@]} - 1 )) slurm/build_refs.sbatch)
 echo "refs       $REFS  (${#BREFS[@]} checkpoints)"
 E1=$(jid --dependency=afterok:$BUILD slurm/e1.sbatch);                echo "e1         $E1"
 REL=$(jid --dependency=afterok:$BUILD slurm/reliability.sbatch);      echo "reliability $REL"
 LAD=$(jid --dependency=afterok:$REFS slurm/e2_ladder.sbatch);         echo "e2 ladder  $LAD"
 COV=$(jid --dependency=afterok:$LAD --array=0-$((E2_SHARDS - 1)) slurm/e2_cov.sbatch)
 echo "e2 cov     $COV"
-PREP=$(jid --dependency=afterok:$BUILD slurm/e3_prepare.sbatch);      echo "e3 prepare $PREP"
+PREP=$(jid --dependency=afterok:$BUILD --gres="$LCSA_GPU_GRES" slurm/e3_prepare.sbatch)
+echo "e3 prepare $PREP"
 REPS=$(jid --dependency=afterok:$PREP --array=0-$(( ${#READERS[@]} * E3_SHARDS - 1 )) slurm/e3_reps.sbatch)
 echo "e3 reps    $REPS"
 HUM=$(jid --dependency=afterok:$PREP --array=0-$E3_BOOT_SHARDS slurm/e3_human.sbatch)
@@ -83,7 +94,7 @@ echo "e4 boot    $BOOT"
 PANEL=$(jid --dependency=afterok:$PREP:$LAD --array=0-$((E6_SHARDS - 1)) slurm/e6_crossed.sbatch)
 echo "e6 panel   $PANEL"
 read -ra SWEEPREFS <<< "$LCSA_SWEEP_REFS"
-SWEEP=$(jid --dependency=afterok:$BUILD --array=0-$(( ${#SWEEPREFS[@]} - 1 )) slurm/refsweep.sbatch)
+SWEEP=$(jid --dependency=afterok:$BUILD --gres="$LCSA_SWEEP_GPU_GRES" --array=0-$(( ${#SWEEPREFS[@]} - 1 )) slurm/refsweep.sbatch)
 echo "refsweep   $SWEEP"
 LEGS=e2,e3,e4,e6
 # The sweep is joined with afterany and the registered legs with afterok: it

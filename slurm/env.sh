@@ -15,6 +15,21 @@ export LCSA_MODEL="${LCSA_MODEL:-Qwen/Qwen2.5-1.5B}"
 # One Hugging Face cache for both papers, on scratch rather than the NFS home.
 export HF_HOME="${HF_HOME:-/athena/accardilab/scratch/$USER/hf}"
 
+# The token for the one gated checkpoint in the appendix sweep,
+# meta-llama/Llama-3.1-8B.  `huggingface-cli login` writes to $HF_HOME/token
+# when HF_HOME is set and to ~/.cache/huggingface/token when it is not, and a
+# login run without this file sourced writes to the second path while every job
+# reads the first, so both are tried here.  Empty means unset: an empty
+# HF_TOKEN makes huggingface_hub send an Authorization header with no token.
+if [ -z "${HF_TOKEN:-}" ]; then
+    for f in "$HF_HOME/token" "$HOME/.cache/huggingface/token"; do
+        [ -s "$f" ] || continue
+        HF_TOKEN="$(tr -d " \t\n\r" < "$f")"
+        break
+    done
+fi
+if [ -n "${HF_TOKEN:-}" ]; then export HF_TOKEN; else unset HF_TOKEN; fi
+
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
@@ -62,6 +77,22 @@ export N_REP="${N_REP:-200}"; export N_BOOT="${N_BOOT:-200}"
 export E2_SHARDS="${E2_SHARDS:-40}"; export E3_SHARDS="${E3_SHARDS:-20}"
 export E3_BOOT_SHARDS="${E3_BOOT_SHARDS:-10}"; export E4_SHARDS="${E4_SHARDS:-10}"
 export E3_READERS="${E3_READERS:-N0 N0-PRIME N-LEX N-TOPIC N-ORDER}"
+# The GPU each job asks for.  Every GPU node is PCIe-only and nothing here uses
+# more than one card, so the choice is about VRAM alone: l40s has 46068 MiB,
+# rtx5000 32760 MiB, rtx6000 23040 MiB, and the a40 figure is not published in
+# the cluster's own table.  The reference path holds the weights plus one
+# forward's logits, which are tokens times a 152k vocabulary, and 23040 MiB is
+# the size of card the seed-noise build ran out of memory on, so the default
+# pins l40s.  Widen it to gpu:1 when the l40s nodes are busy and the model is
+# small; `lcsa build` still refuses a card that cannot hold the batch.
+export LCSA_GPU_GRES="${LCSA_GPU_GRES:-gpu:l40s:1}"
+# The sweep's 7B and 8B checkpoints in float16 are 14 and 16 GB of weights
+# before the logits, so this one stays pinned even when the above is widened.
+export LCSA_SWEEP_GPU_GRES="${LCSA_SWEEP_GPU_GRES:-gpu:l40s:1}"
+# QOS normal caps a user at 250 running jobs; the rest queue rather than fail.
+# pipeline.sh warns when one submission's array tasks exceed this.
+export LCSA_MAX_RUNNING="${LCSA_MAX_RUNNING:-250}"
+
 # Reference checkpoints for E4 and the ladder generator, built on the primary's
 # frozen candidate sets by build_refs.sbatch; slugs replace "/" with "_".
 export LCSA_REFS="${LCSA_REFS:-gpt2-large gpt2 Qwen/Qwen2.5-0.5B}"

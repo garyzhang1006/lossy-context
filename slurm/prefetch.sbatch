@@ -50,8 +50,11 @@ def fetch(repo, patterns):
                 continue
             if code in (401, 403):
                 raise SystemExit(
-                    f"{repo} is gated: accept its licence on the Hub and run `huggingface-cli login` "
-                    "on a login node (the token lives in HF_HOME), then resubmit") from exc
+                    f"{repo} is gated and this job has "
+                    f"{'a token that does not grant access to it' if os.environ.get('HF_TOKEN') else 'no token'}. "
+                    "Accept its licence on the repository's Hub page, then put the token where "
+                    "slurm/env.sh looks for it: `huggingface-cli login` on a login node, or write it "
+                    "to ~/.cache/huggingface/token, and resubmit") from exc
             raise
     raise SystemExit(f"{repo}: six attempts were all answered with HTTP 429")
 
@@ -79,8 +82,21 @@ def get(repo):
 # The appendix sweep checkpoints are read only by refsweep.sbatch, which calls
 # require_prefetched and fails on its own; a gated Llama-3.1-8B must not cancel
 # the build, which is what afterok on this job would otherwise do.
+# Said once, up front: a gated repository with no token wastes the whole
+# download before failing on the last checkpoint in the list.
+GATED = ("meta-llama/", "mistralai/", "google/gemma")
 required = [os.environ["LCSA_MODEL"], *os.environ["LCSA_REFS"].split()]
 optional = [m for m in os.environ["LCSA_SWEEP_REFS"].split() if m not in required]
+if not os.environ.get("HF_TOKEN"):
+    blocked = [m for m in required + optional if m.startswith(GATED)]
+    if blocked:
+        print("no HF_TOKEN in this job's environment, so these gated checkpoints will be skipped: "
+              + " ".join(blocked), flush=True)
+        print("to include them, accept each licence on the Hub and run `huggingface-cli login` on a "
+              "login node, then resubmit this job", flush=True)
+    if any(m in required for m in blocked):
+        raise SystemExit("a gated checkpoint is in LCSA_MODEL or LCSA_REFS, which the registered "
+                         "legs depend on; the run cannot proceed without a token")
 done, skipped = [], []
 for m in required:
     get(m)

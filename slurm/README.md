@@ -24,7 +24,24 @@ seed-noise repository. `/scu-storage03/accardilab` is login-only and is never
 referenced. The torch wheel carries its own CUDA runtime, so the `cuda/13.0`
 module (nvcc only) and apptainer are not needed.
 
-Every GPU job pins `gpu:l40s:1`. What fills a card during a build is the
+Nothing here writes to `$TMPDIR`, the node-local `/scratch/$USER_$JOBID`,
+because Slurm deletes it when the job ends and a build that lands there is
+lost. Every path a job writes comes from `slurm/env.sh` and sits under
+`LCSA_ROOT`.
+
+Every GPU job pins `gpu:l40s:1` through `LCSA_GPU_GRES`, and the appendix
+sweep pins the same card through `LCSA_SWEEP_GPU_GRES`, which stays pinned
+even if the first is widened, since its 7B and 8B checkpoints are 14 and 16 GB
+of float16 weights before any logits. The GPU nodes differ mostly in VRAM:
+
+| type | cards per node | VRAM per card | compute capability |
+| --- | --- | --- | --- |
+| `l40s` | 4 | 46068 MiB | 8.9 |
+| `rtx5000` | 4 | 32760 MiB | 8.9 |
+| `rtx6000` | 2 | 23040 MiB | 7.5 |
+| `a40` | 4 | not published in the cluster's table | not published |
+
+What fills a card during a build is the
 logits tensor, tokens forwarded times vocabulary size, and that term does not
 shrink with the model: sixty candidate rows of a thousand tokens under a
 152k-word vocabulary are 18 GB in float16 before any float32 copy, which is
@@ -135,9 +152,23 @@ file with a different count instead of dropping the tail from the last shard.
    `SUBTLEXusfrequencyabove1.csv` into `.../lossy-context/data/`. Both
    corpora sit behind browser downloads (OSF and UGent), so no script fetches
    them. Set `LCSA_SUBTLEX` if the file has another name.
-3. If any checkpoint is gated (Llama-3.1-8B is), accept its licence and run
-   `huggingface-cli login` on a login node so the token sits in `HF_HOME`.
-4. `bash slurm/pipeline.sh` submits the chain below, starting with
+3. If any checkpoint is gated (`meta-llama/Llama-3.1-8B` in the appendix
+   sweep is, and nothing else in the registered legs is), accept its licence
+   on the Hub, then put a read token where the jobs look for it. `env.sh`
+   reads `$HF_TOKEN` first, then `$HF_HOME/token`, then
+   `~/.cache/huggingface/token`, and treats an empty value as unset, because
+   an empty `HF_TOKEN` makes `huggingface_hub` send an Authorization header
+   with no token behind it. `huggingface-cli login` writes to the first of
+   those two files when `HF_HOME` is set in the shell and to the second when
+   it is not, which is why both are tried. Without a token the sweep skips
+   that one checkpoint, names it as missing in `refsweep.csv`, and every
+   registered leg still merges.
+4. `bash slurm/preflight.sh` checks the partitions, the gres string, the
+   scratch paths, the venv, the three corpus files and the array width
+   against the running-job cap, and prints one line per check. It runs in a
+   few seconds on a login node and reports the failures that would otherwise
+   appear one job at a time over the following day.
+5. `bash slurm/pipeline.sh` submits the chain below, starting with
    `prefetch.sbatch` and `register.sbatch`, which every other job waits on.
    The chain includes E6 and the reference sweep; E5 is submitted and
    registered only when `LCSA_PARTICIPANTS` points at the per-participant
