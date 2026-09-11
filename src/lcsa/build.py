@@ -199,11 +199,17 @@ def build_corpus(
         if grp is None or float(grp["count"].sum()) < cfg.min_responses:
             continue
         passage = provo.passages[int(r.text_id)]
-        # word_number is 1-based in Provo; index 0 has no context and no cache.
-        ti = int(r.word_number) - 1
-        if ti <= 0 or ti >= len(passage):
+        # Passages are indexed by word_number, whose empty slots are the numbers
+        # Provo does not carry, so the depth counts the real words below the
+        # target rather than the index itself: three passages are missing a word
+        # in the middle, and every passage is missing its first.
+        ti = int(r.word_number)
+        if not (0 < ti < len(passage)) or not passage[ti]:
             continue
-        K = min(ti, cfg.max_depth)
+        n_context = sum(1 for x in passage[:ti] if x)
+        if n_context == 0:
+            continue
+        K = min(n_context, cfg.max_depth)
         if select is not None and not select(int(r.text_id), int(r.word_number), K):
             continue
 
@@ -258,8 +264,8 @@ def build_corpus(
 
     if not P_list:
         raise ValueError(
-            "no target survived construction; check that word_number is 1-based "
-            "and that the response file matches the passage list"
+            "no target survived construction; check that the passage lists are "
+            "indexed by word_number and that the response file matches them"
         )
     return Corpus(
         P_list, n_list, u_list, f_list, g_list, clusters, wid, FEATURE_NAMES, slots
@@ -291,7 +297,7 @@ def provo_perplexity(provo: ProvoData, scorer) -> dict:
     """
     total, count, per, mink = 0.0, 0, {}, {}
     for tid, ws in provo.passages.items():
-        nll, n, tokens = scorer.passage_nll(ws)
+        nll, n, tokens = scorer.passage_nll([w for w in ws if w])
         total += nll
         count += n
         per[int(tid)] = float(np.exp(nll / n)) if n else float("nan")

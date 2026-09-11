@@ -80,7 +80,9 @@ def test_keys_are_returned_in_corpus_order(built):
 def test_depth_is_the_number_of_preceding_words_capped_at_the_config(built):
     provo, corpus, _, keys = built
     for (tid, wn), tgt in zip(keys, corpus):
-        assert tgt.K == min(wn - 1, 4)
+        # Passages are indexed by word_number and Provo numbers from 2, so the
+        # words below the target are numbered 2..wn-1, which is wn - 2 of them.
+        assert tgt.K == min(wn - 2, 4)
 
 
 def test_cache_rows_are_distributions_and_differ_across_depth(built):
@@ -121,7 +123,7 @@ def test_the_corpus_word_is_in_its_own_candidate_set(built):
 def test_prior_mention_flags_words_already_seen_in_the_passage(built):
     provo, corpus, words, keys = built
     for (tid, wn), tgt, ws in zip(keys, corpus, words):
-        seen = {canonical_word(x) for x in provo.passages[tid][: wn - 1]}
+        seen = {canonical_word(x) for x in provo.passages[tid][:wn] if x}
         assert [bool(x) for x in tgt.g] == [w in seen for w in ws]
 
 
@@ -149,9 +151,9 @@ def test_gaze_table_aligns_to_the_built_targets_and_never_imputes(built):
     assert y.shape == (len(corpus),)
     assert ctrl.shape == (len(corpus), 2)
     assert list(passage) == [t for t, _ in keys]
-    # Passage 2 words 2 and 6 have no eye-tracking record in the fixture.
+    # Passage 2 word_numbers 3 and 7 have no eye-tracking record in the fixture.
     missing = {(t, w) for (t, w), v in zip(keys, y) if not np.isfinite(v)}
-    assert missing == {(2, 2), (2, 6)}
+    assert missing == {(2, 3), (2, 7)}
 
 
 def test_window_surprisal_is_finite_where_the_target_word_is_a_candidate(built):
@@ -240,14 +242,17 @@ def test_passage_perplexity_is_finite_and_counts_every_token(built, scorer):
 
     provo = built[0]
     rec = provo_perplexity(provo, scorer)
-    n_expected = sum(len(" ".join(ws).encode("utf-8")) for ws in provo.passages.values())
+    # The empty slots are word numbers Provo does not carry, so they are dropped
+    # before the join exactly as provo_perplexity drops them before scoring.
+    n_expected = sum(len(" ".join(w for w in ws if w).encode("utf-8"))
+                     for ws in provo.passages.values())
     assert rec["n_tokens"] == n_expected
     assert np.isfinite(rec["perplexity"]) and rec["perplexity"] > 1.0
     assert set(rec["per_passage"]) == set(provo.passages)
     assert set(rec["per_passage_min_k"]) == set(provo.passages)
     # Min-K% averages the least likely fifth, so it sits at or below the mean.
     for tid, ws in provo.passages.items():
-        nll, n, tokens = scorer.passage_nll(ws)
+        nll, n, tokens = scorer.passage_nll([w for w in ws if w])
         assert tokens.shape == (n,) and abs(tokens.sum() - nll) < 1e-6
         assert rec["per_passage_min_k"][tid] <= -nll / n + 1e-9
 

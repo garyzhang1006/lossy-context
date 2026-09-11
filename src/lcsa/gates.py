@@ -73,7 +73,7 @@ def g0_data_integrity(raw_norms, provo, corpus=None) -> GateResult:
     mism = 0
     for r in provo.words.itertuples():
         passage = provo.passages.get(int(r.text_id))
-        i = int(r.word_number) - 1
+        i = int(r.word_number)  # passages are indexed by word_number
         if passage is None or not (0 <= i < len(passage)):
             mism += 1
         elif str(passage[i]).strip().lower() != str(r.word).strip().lower():

@@ -132,7 +132,7 @@ class ProvoData:
 
     responses: pd.DataFrame  # text_id, word_number, response, count
     words: pd.DataFrame  # text_id, word_number, word, is_content, total_responses
-    passages: dict[int, list[str]]  # text_id -> word list in reading order
+    passages: dict[int, list[str]]  # text_id -> words indexed by word_number
     gaze: pd.DataFrame | None  # text_id, word_number, participant_id, gaze
     intersection_size: int
     encoding: str
@@ -212,6 +212,14 @@ def load_provo(
         .sort_values(["text_id", "word_number"])
         .reset_index(drop=True)
     )
+    # Indexed by word_number, not by position: Provo numbers words from 2,
+    # because a passage's first word has no context and so no cloze
+    # predictability, and three passages are missing a word in the middle.  A
+    # list compacted to the rows present puts the wrong word at every index,
+    # which G0 sees as a join mismatch on every target and which would
+    # otherwise score every model on a context shifted by one word.  Index 0,
+    # word_number 1 and any gap hold the empty string; context_string drops
+    # those, so a depth of K still retains K real words.
     passages: dict[int, list[str]] = {}
     for tid, grp in w.groupby("text_id"):
         g = grp.sort_values("word_number")
@@ -223,7 +231,10 @@ def load_provo(
                 "context strings will use the words present",
                 tid, len(nums), nums.min(), nums.max(),
             )
-        passages[int(tid)] = [str(x) for x in g["word"].tolist()]
+        row = [""] * (int(nums.max()) + 1)
+        for num, word in zip(nums, g["word"].tolist()):
+            row[int(num)] = str(word)
+        passages[int(tid)] = row
 
     gaze = None
     eye_path = d / eye_name

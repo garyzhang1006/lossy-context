@@ -302,7 +302,7 @@ def _e3_h_specs(args, corpus) -> dict:
         provo = load_provo(args.provo_dir, require_eye=False)
         keys = _read_keys(Path(args.targets))
         words = json.loads(Path(args.candidates).read_text())
-        contexts = [context_string(provo.passages[int(t)], int(w) - 1, None)
+        contexts = [context_string(provo.passages[int(t)], int(w), None)
                     for t, w in keys]
         scorer = ReferenceScorer(args.model, dtype=args.dtype)
         scorer.memory_preflight()

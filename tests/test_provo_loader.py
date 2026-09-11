@@ -19,12 +19,17 @@ PASSAGES = {
     1: ["The", "sailor", "told", "the", "story", "again"],
     2: ["A", "chemist", "named", "NA", "worked", "late"],
 }
+# Provo numbers words from 2, because the first word of a passage has no
+# context and so no cloze predictability, and the fixtures start there too: a
+# fixture numbered from 1 hides an off-by-one that shifts every context string
+# by a word against the real corpus.
+FIRST_WORD_NUMBER = 2
 
 
 def _norms_rows():
     rows = []
     for tid, words in PASSAGES.items():
-        for i, w in enumerate(words, start=1):
+        for i, w in enumerate(words, start=FIRST_WORD_NUMBER):
             # Three response types per target, one of which is the word itself.
             for resp, count in ((w.lower(), 20), ("NA", 3), ("thing", 17)):
                 rows.append({
@@ -39,10 +44,10 @@ def _norms_rows():
     return pd.DataFrame(rows)
 
 
-def _eye_rows(skip=(2, 6)):
+def _eye_rows(skip=(3, 7)):
     rows = []
     for tid, words in PASSAGES.items():
-        for i, w in enumerate(words, start=1):
+        for i, w in enumerate(words, start=FIRST_WORD_NUMBER):
             if tid == 2 and i in skip:
                 continue  # the arms disagree, as they do in the real corpus
             for pid in range(4):
@@ -86,9 +91,37 @@ def test_passages_and_targets_are_reconstructed(provo_dir):
     assert provo.n_passages == 2
     assert provo.n_targets == 12
     assert provo.n_responses == pytest.approx(12 * 40)
-    assert provo.passages[2][3] == "NA"
-    assert provo.passages[1][0] == "Thé"
-    assert len(provo.passages[1]) == 6
+    # Indexed by word_number, so "NA" is word 5 of passage 2 and the accented
+    # first target is word 2 of passage 1; word 1 has no cloze row anywhere.
+    assert provo.passages[2][5] == "NA"
+    assert provo.passages[1][2] == "Thé"
+    assert provo.passages[1][:2] == ["", ""]
+    assert len(provo.passages[1]) == FIRST_WORD_NUMBER + len(PASSAGES[1])
+
+
+def test_a_gap_does_not_shift_the_words_after_it(tmp_path):
+    """Three real passages are missing a word, and compacting moved every later one."""
+    rows = [r for r in _norms_rows().to_dict("records") if r["Word_Number"] != 4]
+    pd.DataFrame(rows).to_csv(
+        tmp_path / "Provo_Corpus-Predictability_Norms.csv", index=False)
+    provo = load_provo(tmp_path, require_eye=False)
+    for r in provo.words.itertuples():
+        assert provo.passages[int(r.text_id)][int(r.word_number)] == r.word
+    assert provo.passages[1][4] == ""
+
+
+def test_a_context_skips_the_gap_rather_than_padding_it(tmp_path):
+    """A depth of K has to retain K real words even when one number is missing."""
+    from lcsa.cache import context_string
+
+    rows = [r for r in _norms_rows().to_dict("records") if r["Word_Number"] != 4]
+    pd.DataFrame(rows).to_csv(
+        tmp_path / "Provo_Corpus-Predictability_Norms.csv", index=False)
+    passage = load_provo(tmp_path, require_eye=False).passages[1]
+    # Passage 1 is The sailor told the story again from word 2, without word 4.
+    assert context_string(passage, 6, None) == "The sailor the"
+    assert context_string(passage, 6, 2) == "sailor the"
+    assert context_string(passage, 2, None) == ""
 
 
 def test_the_two_arms_are_reconciled_to_their_intersection(provo_dir):
@@ -138,7 +171,7 @@ def test_gate_g0_catches_a_shifted_join(provo_dir):
     """One misaligned word index is the failure that would poison every cache row."""
     raw, _ = read_provo_csv(provo_dir / "Provo_Corpus-Predictability_Norms.csv")
     provo = load_provo(provo_dir)
-    provo.passages[1] = ["WRONG"] + provo.passages[1][1:]
+    provo.passages[1][FIRST_WORD_NUMBER] = "WRONG"
     g = g0_data_integrity(raw, provo)
     assert g.measured["join_mismatches"] >= 1
     assert not g.passed

@@ -43,13 +43,18 @@ __all__ = ["ReferenceScorer", "context_string", "depth_contexts"]
 
 
 def context_string(words: Sequence[str], target_index: int, depth: int | None) -> str:
-    """Context text for a target at ``target_index`` retaining the last ``depth`` words.
+    """Context text before ``target_index`` retaining the last ``depth`` words.
+
+    ``words`` is a passage indexed by Provo word_number, so ``target_index`` is
+    the target's own word_number and the context is everything numbered below it.
 
     ``depth=None`` means the full preceding context.  ``depth=0`` gives the empty
     string, which is the row the truncation mixture weights most heavily as
     ``delta`` grows.
     """
-    prefix = list(words[:target_index])
+    # Empty entries are the word numbers Provo does not carry, so they are
+    # dropped before the depth slice and a depth of K retains K real words.
+    prefix = [w for w in words[:target_index] if w]
     if depth is not None:
         prefix = prefix[len(prefix) - depth :] if depth > 0 else []
     return " ".join(prefix)
