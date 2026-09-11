@@ -57,6 +57,16 @@ this directory, because each script finds `slurm/env.sh` through
 somewhere else. If the clone already exists, `git pull` instead, since a stale
 checkout is how a fixed bug comes back.
 
+The repository is private, so an anonymous clone fails with `fatal: could not
+read Username for 'https://github.com'` and the API returns 404, which is what
+GitHub returns for a private repository and a nonexistent one alike. If that
+happens, the user has not granted this machine access yet: ask them for a
+read-only deploy key or a different URL, and do not go looking for a
+similar-looking public repository, because running the wrong code against a
+pre-registered design is worse than stopping. A deploy key needs
+`ssh.github.com` on port 443 in `~/.ssh/config`, since clusters block outbound
+port 22.
+
 Then run `bash slurm/preflight.sh`, and run it again after every step that
 could change its answer. It checks the partitions, the GPU type, the scratch paths, the
 virtualenv, the three corpus files and the array width against the running-job
