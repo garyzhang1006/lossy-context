@@ -15,7 +15,12 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16000M
 #SBATCH --time=02:00:00
-#SBATCH --output=/athena/accardilab/scratch/%u/lossy-context/logs/%x-%j.out
+# This job's log lands in the directory it was submitted from, and not in
+# $LCSA_ROOT/logs like every other one: Slurm fails a job outright when its
+# --output directory does not exist, and on a fresh account nothing has created
+# anything under the lab scratch yet.  This job creates $LCSA_ROOT/logs below,
+# so every later job can write there.
+#SBATCH --output=lcsa-setup-%j.out
 set -euo pipefail
 REPO="${LCSA_REPO:-${SLURM_SUBMIT_DIR:-}}"
 [ -f "$REPO/pyproject.toml" ] || { echo "submit from the repository root or export LCSA_REPO" >&2; exit 2; }

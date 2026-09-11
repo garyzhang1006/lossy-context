@@ -58,9 +58,15 @@ Once that marker exists `env.sh` sets `HF_HUB_OFFLINE=1` inside every job, and
 each GPU script calls `require_prefetched` on its model before loading
 anything, so no array task talks to the Hub. Twenty-seven tasks doing so at
 once from the cluster's shared address is how the seed-noise run collected
-429s. Llama-3.1-8B is gated: accept the licence on the Hub and run
-`huggingface-cli login` on a login node (the token lives in `HF_HOME`) before
-submitting.
+429s. The primary and the three E4 references are fetched first and a failure
+there fails the job, because everything waits on it; the four appendix sweep
+checkpoints are fetched afterwards and a failure only records the checkpoint as
+skipped, so the gated Llama-3.1-8B cannot cancel the build. Each snapshot is
+checked for a weights file and refetched allowing `*.bin` when a repository
+ships no safetensors, since the alternative is discovering the gap hours later
+inside a GPU job running offline. To include the gated checkpoints, accept the
+licence on the Hub and run `huggingface-cli login` on a login node (the token
+lives in `HF_HOME`) before submitting.
 
 ## The registration is a file the merge consumes
 
@@ -96,13 +102,33 @@ slowest task rather than the sum. The paper budgets the one-process CPU legs
 at about 90 core-hours; spread over roughly 150 concurrent tasks the wall
 clock after the builds is set by the ladder and the sweep, a few hours each.
 
+## What a task's shard range comes from
+
+An array task takes its range from the count in `env.sh` and not from the size
+of the array Slurm happens to be running, so requeueing one failed task on its
+own (`--array=7`) still computes that task's own replicates; the older form
+read `SLURM_ARRAY_TASK_MAX` and silently recomputed the range as if the whole
+loop were eight shards wide. A task whose index falls outside the registered
+tiling stops with the correct `--array` line in the message rather than dying
+on an unbound array element, which is also what a `LCSA_REFS` or
+`LCSA_SWEEP_REFS` list of a different length now produces. `pipeline.sh` sizes
+both reference arrays from those lists and refuses a shard count above the
+replicate count it has to tile, which would otherwise hand the last tasks an
+empty range. E5 is the one loop whose length is not known until its file is
+read, so the grid is declared as `N_PART` and `lcsa e5` refuses a participant
+file with a different count instead of dropping the tail from the last shard.
+
 ## Order of operations
 
 1. `bash slurm/setup.sh` (or `sbatch slurm/setup.sbatch`) submits the
    install as a scu-cpu job: the virtualenv on scratch from the compute
    nodes' `/usr/bin/python3`, this checkout with the gpu, rt and dev extras,
    and `lcsa selftest`, which needs no data and no GPU. Wait for it to finish
-   before step 4.
+   before step 4. This job alone writes its log to `lcsa-setup-<jobid>.out`
+   in the directory you submitted from, rather than to `$LCSA_ROOT/logs`:
+   Slurm fails a job outright when its `--output` directory does not exist,
+   and on a fresh account nothing under the lab scratch has been created yet.
+   This job creates `$LCSA_ROOT/logs`, so every later job logs there.
 2. Copy `Provo_Corpus-Predictability_Norms.csv` and
    `Provo_Corpus-Eyetracking_Data.csv` into
    `/athena/accardilab/scratch/$USER/lossy-context/data/provo/` and
@@ -123,7 +149,7 @@ clock after the builds is set by the ladder and the sweep, a few hours each.
 | `prefetch.sbatch` | scu-cpu | 2 cpu, 8000M | 6 h | every checkpoint downloaded sequentially into `HF_HOME`, then the corpus files checked; writes the offline marker |
 | `register.sbatch` | scu-cpu | 1 cpu, 2000M | 10 min | `lcsa register`: the frozen design, predictions and reading rule with their SHA-256 |
 | `build.sbatch` | scu-gpu | 1 L40S, 8 cpu, 48000M | 12 h | the memory preflight, a 20-target smoke build with a throughput extrapolation, then the full build at the registered settings |
-| `build_refs.sbatch` | scu-gpu | array 0-2, 1 L40S, 8 cpu, 48000M | 12 h | GPT-2-large, GPT-2-small and Qwen2.5-0.5B caches on the primary's frozen candidate sets |
+| `build_refs.sbatch` | scu-gpu | array of `LCSA_REFS`, 1 L40S, 8 cpu, 48000M | 12 h | GPT-2-large, GPT-2-small and Qwen2.5-0.5B caches on the primary's frozen candidate sets |
 | `e1.sbatch` | scu-cpu | 4 cpu, 16000M | 12 h | exactness, sensitivity, residual fractions |
 | `e2_ladder.sbatch` | scu-cpu | 4 cpu, 16000M | 12 h | the ladder generated under GPT-2-large and fitted under Qwen, plus `e2_theta0.json` |
 | `e2_cov.sbatch` | scu-cpu | array of `E2_SHARDS`, 4 cpu, 16000M | 12 h | coverage replicates at rungs 4, 8, 12, 16, 20, 24 and 32; the ceiling is read from these |
@@ -134,14 +160,17 @@ clock after the builds is set by the ladder and the sweep, a few hours each.
 | `reliability.sbatch` | scu-cpu | 2 cpu, 8000M | 4 h | G3: debiased split-half JS and participant-half gaze reliability |
 | `e5_participants.sbatch` | scu-cpu | array of `E5_SHARDS`+1, 4 cpu, 16000M | 12 h | per-participant half-lives pinned to the pooled nuisances, split-half reliability, alignments; needs `LCSA_PARTICIPANTS` |
 | `e6_crossed.sbatch` | scu-cpu | array of `E6_SHARDS`, 4 cpu, 16000M | 12 h | the crossed panel: decay at 4, 8, 16 with and without the N-ORDER tilt |
-| `refsweep.sbatch` | scu-gpu | array of 4, 1 L40S, 8 cpu, 64000M | 24 h | Pythia-410M, Pythia-1.4B, Qwen2.5-7B, Llama-3.1-8B caches on the frozen candidates and the human fit under each |
+| `refsweep.sbatch` | scu-gpu | array of `LCSA_SWEEP_REFS`, 1 L40S, 8 cpu, 64000M | 24 h | Pythia-410M, Pythia-1.4B, Qwen2.5-7B, Llama-3.1-8B caches on the frozen candidates and the human fit under each |
 | `confounds.sbatch` | scu-cpu | 4 cpu, 16000M | 12 h | the human counts fitted under each reference cache with its Provo perplexity, plus the Min-K% tertile refits |
 | `e4_sweep.sbatch` | scu-cpu | 4 cpu, 32000M | 24 h | the sweep under six references, reading-time gains, hard-window likelihoods |
 | `e4_boot.sbatch` | scu-cpu | array of `E4_SHARDS`, 4 cpu, 32000M | 12 h | the argmax bootstrap under the same references |
-| `merge.sbatch` | scu-cpu | 2 cpu, 8000M | 1 h | `lcsa register --check`, `lcsa merge` with the scorecard, the gate summary, the manifest |
+| `merge.sbatch` | scu-cpu | 2 cpu, 8000M | 1 h | `lcsa register --check`, `lcsa merge` with the scorecard, `refsweep.csv` collected from the sweep tasks, the gate summary, the manifest |
 
 Every job depends on its inputs with `afterok`, so a failed stage leaves its
-dependants pending and `scancel` clears them. `build.sbatch` and
+dependants pending and `scancel` clears them. The one exception is
+`refsweep.sbatch`, which `merge.sbatch` joins with `afterany`, because the
+sweep feeds one appendix table and a checkpoint that ran out of memory or was
+never fetched should drop out of that table rather than cancel the merge. `build.sbatch` and
 `build_refs.sbatch` skip a build whose `cache.npz` exists, so resubmitting
 after a partial run costs only the smoke pass. `N_REP`, `N_BOOT` and the
 shard counts are read from the environment, so

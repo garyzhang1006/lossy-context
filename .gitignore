@@ -17,3 +17,4 @@ data/interim/
 .DS_Store
 .ipynb_checkpoints/
 artifacts/
+lcsa-setup-*.out

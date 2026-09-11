@@ -17,7 +17,30 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 LCSA_VARS_ONLY=1 . slurm/env.sh
 [ -f "$LCSA_VENV/bin/activate" ] || { echo "no venv at $LCSA_VENV; sbatch slurm/setup.sbatch and wait for it first" >&2; exit 2; }
 read -ra READERS <<< "$E3_READERS"
-jid() { sbatch --parsable --export=ALL "$@" | cut -d';' -f1; }
+
+# env.sh created $LCSA_ROOT/logs above; Slurm fails a job outright when its
+# --output directory is absent.  When LCSA_ROOT has been moved off the default
+# the logs follow it rather than going to the path baked into the #SBATCH lines.
+SBOPT=()
+[ "$LCSA_ROOT" = "/athena/accardilab/scratch/$USER/lossy-context" ] \
+    || SBOPT=(--output="$LCSA_ROOT/logs/%x-%A_%a.out")
+jid() { sbatch --parsable --export=ALL ${SBOPT[@]+"${SBOPT[@]}"} "$@" | cut -d';' -f1; }
+
+# Every array tiles [0, N) by integer division, so a shard count above the
+# replicate count hands the last tasks an empty range and `lcsa` dies on
+# "replicate range must satisfy 0 <= start < stop".  Catch it at submit time,
+# where one message beats a hundred failed array tasks.
+while read -r var total; do
+    [ "${!var}" -ge 1 ] && [ "${!var}" -le "$total" ] || {
+        echo "$var=${!var} must be between 1 and the $total replicates it tiles" >&2; exit 2; }
+done <<EOF
+E2_SHARDS $N_REP
+E3_SHARDS $N_REP
+E6_SHARDS $N_REP
+E3_BOOT_SHARDS $N_BOOT
+E4_SHARDS $N_BOOT
+E5_SHARDS $N_PART
+EOF
 if [ "${1:-}" = robustness ]; then
     [ "$LCSA_KERNEL" != power ] || { echo "robustness needs LCSA_KERNEL=linear" >&2; exit 2; }
     [ -f "$LCSA_ROOT/build/cache.npz" ] || { echo "no primary cache; run the registered pipeline first" >&2; exit 1; }
@@ -39,7 +62,9 @@ REGLEGS=e1,e2,e3,e4,e6
 if [ -n "${LCSA_PARTICIPANTS:-}" ] && [ -f "$LCSA_PARTICIPANTS" ]; then REGLEGS=$REGLEGS,e5; fi
 REG=$(REGISTER_LEGS=$REGLEGS jid slurm/register.sbatch);              echo "register   $REG  (legs $REGLEGS)"
 BUILD=$(jid --dependency=afterok:$PRE:$REG slurm/build.sbatch);       echo "build      $BUILD"
-REFS=$(jid --dependency=afterok:$BUILD slurm/build_refs.sbatch);      echo "refs       $REFS"
+read -ra BREFS <<< "$LCSA_REFS"
+REFS=$(jid --dependency=afterok:$BUILD --array=0-$(( ${#BREFS[@]} - 1 )) slurm/build_refs.sbatch)
+echo "refs       $REFS  (${#BREFS[@]} checkpoints)"
 E1=$(jid --dependency=afterok:$BUILD slurm/e1.sbatch);                echo "e1         $E1"
 REL=$(jid --dependency=afterok:$BUILD slurm/reliability.sbatch);      echo "reliability $REL"
 LAD=$(jid --dependency=afterok:$REFS slurm/e2_ladder.sbatch);         echo "e2 ladder  $LAD"
@@ -61,7 +86,10 @@ read -ra SWEEPREFS <<< "$LCSA_SWEEP_REFS"
 SWEEP=$(jid --dependency=afterok:$BUILD --array=0-$(( ${#SWEEPREFS[@]} - 1 )) slurm/refsweep.sbatch)
 echo "refsweep   $SWEEP"
 LEGS=e2,e3,e4,e6
-DEPS=$E1:$REL:$COV:$REPS:$HUM:$SELF:$CONF:$SW:$BOOT:$PANEL:$SWEEP
+# The sweep is joined with afterany and the registered legs with afterok: it
+# feeds one appendix table that merge reports as missing when a checkpoint did
+# not run, so an out-of-memory 8B task must not cancel the whole merge.
+DEPS=$E1:$REL:$COV:$REPS:$HUM:$SELF:$CONF:$SW:$BOOT:$PANEL
 # E5 needs the per-participant cloze export, which the distributed norms do not
 # carry; without it the leg is skipped here instead of failing the chain.
 if [ -n "${LCSA_PARTICIPANTS:-}" ] && [ -f "$LCSA_PARTICIPANTS" ]; then
@@ -71,6 +99,6 @@ if [ -n "${LCSA_PARTICIPANTS:-}" ] && [ -f "$LCSA_PARTICIPANTS" ]; then
 else
     echo "e5 skipped: set LCSA_PARTICIPANTS to the per-participant cloze file to run it"
 fi
-MERGE=$(MERGE_LEGS=$LEGS jid --dependency=afterok:$DEPS slurm/merge.sbatch)
+MERGE=$(MERGE_LEGS=$LEGS jid --dependency=afterok:$DEPS,afterany:$SWEEP slurm/merge.sbatch)
 echo "merge      $MERGE  (legs $LEGS)"
 echo "watch with: squeue -u \$USER ; logs under $LCSA_ROOT/logs"

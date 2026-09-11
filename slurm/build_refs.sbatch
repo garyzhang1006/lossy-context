@@ -28,6 +28,12 @@ ENV="${LCSA_REPO:-$SLURM_SUBMIT_DIR}/slurm/env.sh"
 B="$LCSA_ROOT/build"
 [ -f "$B/cache.npz" ] || { echo "no cache at $B/cache.npz; run slurm/build.sbatch first" >&2; exit 1; }
 read -ra REFS <<< "$LCSA_REFS"
+# The --array line above is the default for the three registered references.
+# slurm/pipeline.sh sizes the array from LCSA_REFS instead, so a hand-submitted
+# array wider than the list would otherwise die on "REFS[3]: unbound variable".
+[ "$SLURM_ARRAY_TASK_ID" -lt "${#REFS[@]}" ] || {
+    echo "task $SLURM_ARRAY_TASK_ID has no checkpoint: LCSA_REFS lists ${#REFS[@]} (${REFS[*]}); submit --array=0-$(( ${#REFS[@]} - 1 ))" >&2
+    exit 2; }
 MODEL="${REFS[$SLURM_ARRAY_TASK_ID]}"
 OUT=$(ref_dir "$MODEL")
 if [ -f "$OUT/cache.npz" ]; then echo "$OUT/cache.npz exists; remove it to rebuild"; exit 0; fi

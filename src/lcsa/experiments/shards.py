@@ -80,7 +80,12 @@ def read_shards(out_dir, stem: str, n_required: int | None = None) -> list[dict]
     spans.sort()
     for (s0, e0, n0), (s1, e1, n1) in zip(spans, spans[1:]):
         if s1 < e0:
-            raise ValueError(f"shards {n0} and {n1} overlap on replicates [{s1}, {e0})")
+            # The usual cause is a resubmission under a different shard count:
+            # the old files are still there and tile the same replicates
+            # differently, so name the fix rather than only the symptom.
+            raise ValueError(
+                f"shards {n0} and {n1} overlap on replicates [{s1}, {e0}); if the array was "
+                f"resubmitted with a different shard count, delete {d} and rerun the leg")
         if s1 > e0:
             raise ValueError(f"replicates [{e0}, {s1}) are missing between {n0} and {n1}")
     if spans[0][0] != 0:

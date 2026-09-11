@@ -70,6 +70,10 @@ export LCSA_REFS="${LCSA_REFS:-gpt2-large gpt2 Qwen/Qwen2.5-0.5B}"
 export LCSA_SWEEP_REFS="${LCSA_SWEEP_REFS:-EleutherAI/pythia-410m EleutherAI/pythia-1.4b Qwen/Qwen2.5-7B meta-llama/Llama-3.1-8B}"
 # E5 and E6 shard counts; E5 needs LCSA_PARTICIPANTS, the per-participant cloze file.
 export E5_SHARDS="${E5_SHARDS:-10}"; export E6_SHARDS="${E6_SHARDS:-20}"
+# The participant grid the E5 array tiles.  It is declared here because the
+# array is submitted before the file is read; `lcsa e5` refuses a file whose
+# count differs rather than dropping the tail of the list from the last shard.
+export N_PART="${N_PART:-470}"
 export E2_GEN_REF="${E2_GEN_REF:-gpt2-large}"
 export E3_SELF_REF="${E3_SELF_REF:-gpt2}"
 # Retention kernel.  "power" is the registered run; LCSA_KERNEL=linear reruns
@@ -78,6 +82,9 @@ export E3_SELF_REF="${E3_SELF_REF:-gpt2}"
 export LCSA_KERNEL="${LCSA_KERNEL:-power}"
 if [ "$LCSA_KERNEL" = power ]; then export LCSA_ART="$LCSA_ROOT/artifacts"
 else export LCSA_ART="$LCSA_ROOT/artifacts_$LCSA_KERNEL"; fi
+# The mkdir above ran before LCSA_ART was known, so a run under a non-default
+# kernel would otherwise reach `lcsa register` with no directory to write into.
+mkdir -p "$LCSA_ART"
 
 # shard_range I N TOTAL -> "start stop" for array task I of N over [0, TOTAL).
 shard_range() {

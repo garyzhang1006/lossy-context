@@ -6,4 +6,6 @@
 #   bash slurm/prefetch.sh
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+# For the log directory the #SBATCH --output line needs; variables only.
+LCSA_VARS_ONLY=1 . slurm/env.sh
 sbatch slurm/prefetch.sbatch

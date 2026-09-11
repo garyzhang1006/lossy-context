@@ -21,7 +21,12 @@ CACHE="$LCSA_ROOT/build/cache.npz"; OUT="$LCSA_ART"
 if [ "$SLURM_ARRAY_TASK_ID" -eq 0 ]; then
     lcsa e3 --kernel "$LCSA_KERNEL" --cache "$CACHE" --out "$OUT" --stage human
 else
-    N=$SLURM_ARRAY_TASK_MAX
+    # As above: the count is the registered variable, so requeueing one task
+    # alone still computes that task's own range.  Task 0 ran the stage above.
+    N="${E3_BOOT_SHARDS:?set by slurm/env.sh}"
+    [ "$SLURM_ARRAY_TASK_ID" -le "$N" ] || {
+        echo "array task $SLURM_ARRAY_TASK_ID is outside the registered E3_BOOT_SHARDS=$N tiling; submit --array=0-$N" >&2
+        exit 2; }
     read -r START STOP <<< "$(shard_range $(( SLURM_ARRAY_TASK_ID - 1 )) "$N" "$N_BOOT")"
     lcsa e3 --kernel "$LCSA_KERNEL" --cache "$CACHE" --out "$OUT" --stage contrast --n-boot "$N_BOOT" \
         --boot-start "$START" --boot-stop "$STOP"

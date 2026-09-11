@@ -18,7 +18,14 @@ ENV="${LCSA_REPO:-$SLURM_SUBMIT_DIR}/slurm/env.sh"
 [ -f "$ENV" ] || { echo "submit from the repository root or export LCSA_REPO" >&2; exit 2; }
 . "$ENV"
 CACHE="$LCSA_ROOT/build/cache.npz"; GEN="$(ref_dir "$E2_GEN_REF")/cache.npz"
-N=$(( SLURM_ARRAY_TASK_MAX + 1 ))
+# The shard count comes from the registered variable, not from the size of the
+# array Slurm happens to be running: requeueing one failed task on its own
+# (`--array=7`) leaves SLURM_ARRAY_TASK_MAX at 7, and the old form then
+# recomputed that task's range as if the whole loop were eight shards wide.
+N="${E2_SHARDS:?set by slurm/env.sh}"
+[ "$SLURM_ARRAY_TASK_ID" -lt "$N" ] || {
+    echo "array task $SLURM_ARRAY_TASK_ID is outside the registered E2_SHARDS=$N tiling; submit --array=0-$((N - 1))" >&2
+    exit 2; }
 read -r START STOP <<< "$(shard_range "$SLURM_ARRAY_TASK_ID" "$N" "$N_REP")"
 lcsa e2 --kernel "$LCSA_KERNEL" --cache "$CACHE" --gen-cache "$GEN" --out "$LCSA_ART" \
     --stage coverage --n-rep "$N_REP" --rep-start "$START" --rep-stop "$STOP"

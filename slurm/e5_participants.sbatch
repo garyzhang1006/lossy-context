@@ -22,14 +22,20 @@ ENV="${LCSA_REPO:-$SLURM_SUBMIT_DIR}/slurm/env.sh"
     echo "LCSA_PARTICIPANTS must point at the per-participant cloze file" >&2; exit 2; }
 B="$LCSA_ROOT/build"
 ARGS=(--kernel "$LCSA_KERNEL" --cache "$B/cache.npz" --out "$LCSA_ART" --e3-out "$LCSA_ART"
-      --participants "$LCSA_PARTICIPANTS" --targets "$B/targets.csv" --candidates "$B/candidates.json")
+      --participants "$LCSA_PARTICIPANTS" --targets "$B/targets.csv" --candidates "$B/candidates.json"
+      --n-participants "$N_PART")
 [ -z "${LCSA_EXTERNAL_FITS:-}" ] || ARGS+=(--external "$LCSA_EXTERNAL_FITS")
 if [ "$SLURM_ARRAY_TASK_ID" -eq 0 ]; then
     lcsa e5 "${ARGS[@]}" --stage pooled
 else
-    N=$SLURM_ARRAY_TASK_MAX
+    # As above: the count is the registered variable, so requeueing one task
+    # alone still computes that task's own range.  Task 0 ran the stage above.
+    N="${E5_SHARDS:?set by slurm/env.sh}"
+    [ "$SLURM_ARRAY_TASK_ID" -le "$N" ] || {
+        echo "array task $SLURM_ARRAY_TASK_ID is outside the registered E5_SHARDS=$N tiling; submit --array=0-$N" >&2
+        exit 2; }
     # The participant count is only known after loading, so the shard takes a
     # slice of the sorted participant list by position, N_PART wide at most.
-    read -r START STOP <<< "$(shard_range $(( SLURM_ARRAY_TASK_ID - 1 )) "$N" "${N_PART:-470}")"
+    read -r START STOP <<< "$(shard_range $(( SLURM_ARRAY_TASK_ID - 1 )) "$N" "$N_PART")"
     lcsa e5 "${ARGS[@]}" --stage fits --rep-start "$START" --rep-stop "$STOP"
 fi

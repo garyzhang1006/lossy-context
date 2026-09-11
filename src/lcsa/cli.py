@@ -57,6 +57,21 @@ def _read_keys(path: Path):
 # -- commands -----------------------------------------------------------------
 
 
+def _ensure_out(out) -> Path:
+    """Create the output directory before a leg writes into it.
+
+    The Slurm scripts point several legs at directories nothing else creates:
+    ``e3_self.sbatch`` writes into ``$LCSA_ART/self_<slug>`` and
+    ``refsweep.sbatch`` into ``$LCSA_ART/refsweep/<slug>``, and a run under a
+    non-default kernel writes into ``artifacts_<kernel>``.  Without this the
+    leg loads its cache, computes for minutes and then dies on the first
+    ``write_text``.
+    """
+    d = Path(out)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def cmd_build(args) -> int:
     from lcsa.build import BuildConfig, build_corpus, gate_g0, provo_perplexity
     from lcsa.cache import ReferenceScorer
@@ -185,6 +200,7 @@ def _models(names):
 def cmd_e1(args) -> int:
     from lcsa.experiments.e1_exactness import run
 
+    _ensure_out(args.out)
     corpus = _load(args)
     res = run(corpus, _models(args.estimators), args.out, kernel=_kernel(args),
               seed=args.seed)
@@ -213,6 +229,7 @@ def cmd_e2(args) -> int:
     from lcsa.fitting import fit_constrained
     from lcsa.store import load_corpus
 
+    _ensure_out(args.out)
     corpus = _load(args)
     models = _models(args.estimators)
     kernel = _kernel(args)
@@ -300,6 +317,7 @@ def _e3_h_specs(args, corpus) -> dict:
 def cmd_e3(args) -> int:
     from lcsa.experiments import e3_nulls as e3
 
+    _ensure_out(args.out)
     corpus = _load(args)
     models = _models(args.estimators)
     kernel = _kernel(args)
@@ -377,6 +395,7 @@ def cmd_e4(args) -> int:
     from lcsa.experiments import e4_reading as e4
     from lcsa.fitting import fit
 
+    _ensure_out(args.out)
     corpus = _load(args)
     models = _models(args.estimators)
     provo = load_provo(args.provo_dir, require_eye=True)
@@ -417,6 +436,7 @@ def cmd_confounds(args) -> int:
     from lcsa.experiments.confounds import run
     from lcsa.store import load_corpus
 
+    _ensure_out(args.out)
     models = _models(args.estimators)
     primary = None
     if args.cache:
@@ -451,6 +471,7 @@ def cmd_reliability(args) -> int:
     from lcsa.data.provo import load_provo
     from lcsa.experiments.reliability_stage import run
 
+    _ensure_out(args.out)
     corpus = _load(args)
     provo = None
     if args.provo_dir:
@@ -486,6 +507,7 @@ def cmd_e5(args) -> int:
     from lcsa.data.provo import load_cloze_participants
     from lcsa.experiments import e5_participants as e5
 
+    _ensure_out(args.out)
     corpus = _load(args)
     models = _models(args.estimators)
     kernel = _kernel(args)
@@ -496,6 +518,15 @@ def cmd_e5(args) -> int:
     if not counts:
         raise SystemExit(f"no participant in {args.participants} reaches {e5.MIN_TARGETS} "
                          "scored targets; check that its keys match targets.csv")
+    # The Slurm array cuts the participant list by position before the file has
+    # been read, so the grid it tiles is declared rather than measured.  A file
+    # with more participants than the grid would drop the tail from the last
+    # shard without a word, and one with fewer leaves empty shards.
+    if args.n_participants is not None and len(counts) != args.n_participants:
+        raise SystemExit(
+            f"{args.participants} yields {len(counts)} participants with at least "
+            f"{e5.MIN_TARGETS} scored targets, but the shards tile {args.n_participants}; "
+            f"set N_PART={len(counts)} and resubmit slurm/e5_participants.sbatch")
     prepared = None
     if args.e3_out:
         from lcsa.experiments.e3_nulls import load_prepared
@@ -532,6 +563,7 @@ def cmd_e6(args) -> int:
     from lcsa.experiments import e6_crossed as e6
     from lcsa.experiments.e3_nulls import load_prepared
 
+    _ensure_out(args.out)
     corpus = _load(args)
     models = _models(args.estimators)
     kernel = _kernel(args)
@@ -829,6 +861,8 @@ def build_parser() -> argparse.ArgumentParser:
     e5.add_argument("--external", default=None,
                     help="csv of external per-participant fits with columns participant, delta")
     e5.add_argument("--stage", choices=["all", "pooled", "fits"], default="all")
+    e5.add_argument("--n-participants", type=int, default=None,
+                    help="participant count the shards tile; a different count in the file is an error")
     shard(e5, "rep", "participant (by sorted position)")
     e5.set_defaults(func=cmd_e5)
 

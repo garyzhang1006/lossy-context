@@ -35,19 +35,25 @@ for f in "$LCSA_PROVO/Provo_Corpus-Predictability_Norms.csv" "$LCSA_SUBTLEX"; do
     [ -f "$f" ] || { echo "missing $f; see slurm/prefetch.sbatch" >&2; exit 1; }
 done
 
+# Checked before the smoke run so that a requeued job costs no GPU time.
+if [ -f "$LCSA_ROOT/build/cache.npz" ]; then
+    echo "$LCSA_ROOT/build/cache.npz exists; remove it to rebuild"; exit 0
+fi
+
 # Twenty targets first: every code path the full build uses, in minutes, and a
 # throughput figure the full run is extrapolated from.
 lcsa --verbose build --provo-dir "$LCSA_PROVO" --subtlex "$LCSA_SUBTLEX" \
     --model "$LCSA_MODEL" --out "$LCSA_ROOT/smoke" --limit 20
 python - "$LCSA_ROOT/smoke/g1.json" <<'PY'
 import json, sys
+# contexts_per_second is null when the smoke run finished inside the clock's
+# resolution, and formatting null used to abort the job before the real build.
 rate = json.load(open(sys.argv[1]))["contexts_per_second"]
-print(f"smoke run: {rate:.1f} contexts/s; full build estimate {61435 / rate / 3600:.2f} h")
+if rate:
+    print(f"smoke run: {rate:.1f} contexts/s; full build estimate {61435 / rate / 3600:.2f} h")
+else:
+    print("smoke run: too fast to time; no estimate for the full build")
 PY
-
-if [ -f "$LCSA_ROOT/build/cache.npz" ]; then
-    echo "$LCSA_ROOT/build/cache.npz exists; remove it to rebuild"; exit 0
-fi
 lcsa --verbose build --provo-dir "$LCSA_PROVO" --subtlex "$LCSA_SUBTLEX" \
     --model "$LCSA_MODEL" --out "$LCSA_ROOT/build" \
     --max-depth 32 --max-candidates 120 --top-k 50

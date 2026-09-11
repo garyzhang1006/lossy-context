@@ -250,22 +250,31 @@ class ReferenceScorer:
             raise ValueError(f"context {context[:40]!r} encoded to nothing")
         return ids[-self.max_prefix_tokens :]
 
+    # Transformers renamed the argument in 4.50; the older spelling is what pip
+    # resolves under the compute nodes' Python 3.9, so both are tried once and
+    # the working one is remembered for the rest of the build.
+    _KEEP_KWARGS = ("logits_to_keep", "num_logits_to_keep")
+
     def _last_logits(self, ids, att, pos):
         """Logits at the final position only, asking the model to keep one row
-        where it supports ``logits_to_keep`` and slicing otherwise."""
+        where it supports either spelling of the argument and slicing otherwise."""
         torch = self.torch
         with torch.no_grad():
             if self._logits_to_keep_ok is not False:
-                try:
-                    out = self.model(input_ids=ids, attention_mask=att, position_ids=pos,
-                                     logits_to_keep=1).logits
-                    self._logits_to_keep_ok = True
+                names = ([self._logits_to_keep_ok] if isinstance(self._logits_to_keep_ok, str)
+                         else self._KEEP_KWARGS)
+                for name in names:
+                    try:
+                        out = self.model(input_ids=ids, attention_mask=att, position_ids=pos,
+                                         **{name: 1}).logits
+                    except TypeError:
+                        continue
+                    self._logits_to_keep_ok = name
                     return out[:, -1, :]
-                except TypeError:
-                    self._logits_to_keep_ok = False
-                    log.warning("%s does not accept logits_to_keep; the reference path keeps "
-                                "every position's logits and needs the memory for it",
-                                self.model_name)
+                self._logits_to_keep_ok = False
+                log.warning("%s accepts neither %s; the reference path keeps every position's "
+                            "logits and needs the memory for it",
+                            self.model_name, " nor ".join(self._KEEP_KWARGS))
             return self.model(input_ids=ids, attention_mask=att, position_ids=pos).logits[:, -1, :]
 
     def _simple_nodes(self, prefix_ids: list[int], trie: CandidateTrie) -> dict[int, np.ndarray]:

@@ -26,17 +26,31 @@ ENV="${LCSA_REPO:-$SLURM_SUBMIT_DIR}/slurm/env.sh"
 B="$LCSA_ROOT/build"
 [ -f "$B/cache.npz" ] || { echo "no cache at $B/cache.npz; run slurm/build.sbatch first" >&2; exit 1; }
 read -ra REFS <<< "$LCSA_SWEEP_REFS"
+# As in build_refs.sbatch: the --array line is the default for the four sweep
+# checkpoints and pipeline.sh sizes it from the list.
+[ "$SLURM_ARRAY_TASK_ID" -lt "${#REFS[@]}" ] || {
+    echo "task $SLURM_ARRAY_TASK_ID has no checkpoint: LCSA_SWEEP_REFS lists ${#REFS[@]} (${REFS[*]}); submit --array=0-$(( ${#REFS[@]} - 1 ))" >&2
+    exit 2; }
 MODEL="${REFS[$SLURM_ARRAY_TASK_ID]}"
 OUT=$(ref_dir "$MODEL")
 if [ ! -f "$OUT/cache.npz" ]; then
-    require_prefetched "$MODEL"
+    # A soft skip and not require_prefetched: these are the appendix checkpoints,
+    # and prefetch.sbatch is allowed to leave a gated one out of the marker.  A
+    # failed task here would cancel merge through its afterok dependency, so the
+    # checkpoint that could not be fetched drops out of the sweep table instead.
+    if ! grep -qxF "$MODEL" "$HF_HOME/lcsa_prefetch.done" 2>/dev/null; then
+        echo "SKIPPED $MODEL: not in $HF_HOME/lcsa_prefetch.done; merge names it as missing from refsweep.csv" >&2
+        exit 0
+    fi
     python -c 'import torch; assert torch.cuda.is_available(), "no CUDA device visible"'
     lcsa --verbose build --provo-dir "$LCSA_PROVO" --subtlex "$LCSA_SUBTLEX" \
         --model "$MODEL" --out "$OUT" --max-depth 32 \
         --candidates "$B/candidates.json" --targets "$B/targets.csv"
     cmp "$B/targets.csv" "$OUT/targets.csv"
 fi
-# The fit under this reference alone; slurm/confounds.sbatch collects every
-# reference into one table once all sweep tasks have finished.
+# The fit under this reference alone.  slurm/confounds.sbatch covers LCSA_REFS
+# and not these, so the per-checkpoint tables written here are concatenated
+# into refsweep.csv by slurm/merge.sbatch, which also names any checkpoint that
+# did not run.
 lcsa confounds --kernel "$LCSA_KERNEL" --reference "${MODEL//\//_}=$OUT" \
     --cache "$B/cache.npz" --out "$LCSA_ART/refsweep/${MODEL//\//_}"

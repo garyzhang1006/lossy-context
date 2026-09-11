@@ -19,6 +19,10 @@ ENV="${LCSA_REPO:-$SLURM_SUBMIT_DIR}/slurm/env.sh"
 [ -f "$ENV" ] || { echo "submit from the repository root or export LCSA_REPO" >&2; exit 2; }
 . "$ENV"
 read -ra READERS <<< "$E3_READERS"
+# The array is ${#READERS[@]} * E3_SHARDS wide; a task past that has no reader.
+[ "$SLURM_ARRAY_TASK_ID" -lt $(( ${#READERS[@]} * E3_SHARDS )) ] || {
+    echo "task $SLURM_ARRAY_TASK_ID is outside ${#READERS[@]} readers x E3_SHARDS=$E3_SHARDS; submit --array=0-$(( ${#READERS[@]} * E3_SHARDS - 1 ))" >&2
+    exit 2; }
 READER="${READERS[$(( SLURM_ARRAY_TASK_ID / E3_SHARDS ))]}"
 read -r START STOP <<< "$(shard_range $(( SLURM_ARRAY_TASK_ID % E3_SHARDS )) "$E3_SHARDS" "$N_REP")"
 lcsa e3 --kernel "$LCSA_KERNEL" --cache "$LCSA_ROOT/build/cache.npz" --out "$LCSA_ART" \
