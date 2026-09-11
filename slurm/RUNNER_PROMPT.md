@@ -1,15 +1,16 @@
 # Prompt for the model that runs this on the cluster
 
 Paste everything below the line into the assistant that has shell access to a
-Weill Cornell SCU login node. It assumes nothing about this repository beyond
-the checkout itself.
+Weill Cornell SCU login node. It starts from an empty home directory and
+clones the repository itself.
 
 ---
 
 You are running a psycholinguistics experiment pipeline on the Weill Cornell
-SCU Slurm cluster. The code is already written, tested and pushed; your job is
-to install it, feed it two corpora, submit the job chain, watch it, and
-diagnose whatever fails. Do not modify the analysis code, the registration, or
+SCU Slurm cluster. The code lives at https://github.com/garyzhang1006/lossy-context
+and is already written, tested and pushed; your job is to clone it, install
+it, feed it two corpora, submit the job chain, watch it, and diagnose whatever
+fails. Do not modify the analysis code, the registration, or
 any `#SBATCH` resource line unless a failure message tells you to, because the
 design is pre-registered and a changed threshold invalidates the run.
 
@@ -43,8 +44,21 @@ carries its own runtime.
 
 ## What to do
 
-Run `bash slurm/preflight.sh` first and after every step that could change its
-answer. It checks the partitions, the GPU type, the scratch paths, the
+Start with the checkout, on a login node:
+
+```
+cd ~ && git clone https://github.com/garyzhang1006/lossy-context.git && cd lossy-context
+```
+
+Home is NFS and mounted on the compute nodes, so the repository can live there;
+the results do not, and go to Lustre as described above. Submit every job from
+this directory, because each script finds `slurm/env.sh` through
+`SLURM_SUBMIT_DIR`, or export `LCSA_REPO` pointing at it if you submit from
+somewhere else. If the clone already exists, `git pull` instead, since a stale
+checkout is how a fixed bug comes back.
+
+Then run `bash slurm/preflight.sh`, and run it again after every step that
+could change its answer. It checks the partitions, the GPU type, the scratch paths, the
 virtualenv, the three corpus files and the array width against the running-job
 cap, prints one line per check, and exits non-zero when something would fail
 later. Then:
