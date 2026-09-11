@@ -82,11 +82,14 @@ later. Then:
    sweep alone, so without a token the sweep skips it, the merge records it as
    missing in `refsweep.csv`, and every registered result still lands. If the
    user wants that row, they accept the licence on the model's Hub page and
-   run `huggingface-cli login` on a login node themselves. Never ask them to
-   paste a token to you and never echo one, because a token in a transcript is
-   a leaked credential. `slurm/env.sh` reads `HF_TOKEN`, then
-   `$HF_HOME/token`, then `~/.cache/huggingface/token`, and treats an empty
-   value as absent.
+   run either `bash slurm/set_hf_token.sh` or `huggingface-cli login` on a
+   login node themselves. The first prompts with the input hidden and writes
+   `$HF_HOME/token` with mode 600, printing back only the length and the `hf_`
+   prefix. Never ask them to paste a token to you and never echo one, because
+   a token in a transcript is a leaked credential. `slurm/env.sh` reads
+   `HF_TOKEN`, then `$HF_HOME/token`, then `~/.cache/huggingface/token`, and
+   treats an empty value as absent. `bash slurm/preflight.sh` says whether a
+   token was found without revealing it.
 4. `bash slurm/pipeline.sh` submits the whole chain with `afterok`
    dependencies and prints one line per job with its id. It starts with
    `prefetch.sbatch`, which downloads every checkpoint sequentially and writes
