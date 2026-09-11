@@ -12,7 +12,7 @@ import json
 
 import numpy as np
 import pytest
-from test_provo_loader import PASSAGES, _eye_rows, _norms_rows
+from test_provo_loader import FIRST_WORD_NUMBER, PASSAGES, _eye_rows, _norms_rows
 from test_tokenization import ByteTokenizer
 
 from lcsa.build import BuildConfig, build_corpus, gate_g0
@@ -67,7 +67,8 @@ def test_every_non_initial_target_is_built(built):
     provo, corpus, _, keys = built
     expected = sum(len(w) - 1 for w in PASSAGES.values())
     assert len(corpus) == expected
-    assert all(wn > 1 for _, wn in keys)
+    # The fixtures number from 2, so the first target of each passage is word 3.
+    assert all(wn > FIRST_WORD_NUMBER for _, wn in keys)
 
 
 def test_keys_are_returned_in_corpus_order(built):
@@ -147,10 +148,11 @@ def test_built_corpus_survives_a_disk_round_trip_and_a_fit(built, tmp_path):
 
 def test_gaze_table_aligns_to_the_built_targets_and_never_imputes(built):
     provo, corpus, _, keys = built
-    y, ctrl, passage = gaze_table(provo, keys, load_subtlex(None))
+    y, ctrl, passage, position = gaze_table(provo, keys, load_subtlex(None))
     assert y.shape == (len(corpus),)
     assert ctrl.shape == (len(corpus), 2)
     assert list(passage) == [t for t, _ in keys]
+    assert list(position) == [w for _, w in keys]
     # Passage 2 word_numbers 3 and 7 have no eye-tracking record in the fixture.
     missing = {(t, w) for (t, w), v in zip(keys, y) if not np.isfinite(v)}
     assert missing == {(2, 3), (2, 7)}
@@ -272,6 +274,30 @@ def test_build_writes_g1_from_tokens_forwarded(provo_dir, scorer, tmp_path, monk
     assert np.isfinite(g1["tflops"]) and g1["passed"] is False
     ppl = json.loads((out / "perplexity.json").read_text())
     assert ppl["min_k_frac"] == 0.2 and len(ppl["per_passage_min_k"]) == 2
+
+
+def test_a_rejected_cache_leaves_no_finished_marker(provo_dir, scorer, tmp_path, monkeypatch):
+    import lcsa.build
+    import lcsa.cache
+    from lcsa.cli import main
+
+    # build.sbatch skips the GPU pass whenever g0_cache.json exists, so a cache
+    # the gate refused must not write it, or a requeue would run the whole
+    # chain on the rejected ablation.
+    monkeypatch.setattr(lcsa.cache, "ReferenceScorer", lambda *a, **k: scorer)
+    monkeypatch.setattr(lcsa.build, "gate_g0", lambda corpus, provo: {
+        "passed": False, "degenerate_targets": 3, "n_checked": 3,
+        "rows_not_normalised": 0})
+    out = tmp_path / "b"
+    argv = ["build", "--provo-dir", str(provo_dir), "--model", "test-tiny",
+            "--out", str(out), "--max-depth", "3", "--max-candidates", "12", "--top-k", "0"]
+    with pytest.raises(SystemExit, match="3 of 3 sampled targets"):
+        main(argv)
+    assert (out / "cache.npz").exists()
+    assert not (out / "g0_cache.json").exists()
+    assert json.loads((out / "g0_cache_failed.json").read_text())["passed"] is False
+    assert main(argv + ["--force"]) == 0
+    assert (out / "g0_cache.json").exists()
 
 
 def test_confounds_command_prints_delta_beside_perplexity(built, tmp_path):

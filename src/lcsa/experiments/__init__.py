@@ -35,7 +35,14 @@ def jsonable(obj):
         return bool(obj)
     if isinstance(obj, (np.floating, float)):
         v = float(obj)
-        return v if np.isfinite(v) else None
+        if np.isnan(v):
+            return None
+        # JSON has no infinity.  An infinite half-life is a real value on the
+        # ladder's top rung, and writing it as null would read back as nan and
+        # drop the rung from every sharded median while the monolithic run
+        # keeps it; the strings round-trip through ``shards.denull`` and
+        # pandas parses them as floats from the CSV tables.
+        return v if np.isfinite(v) else ("inf" if v > 0 else "-inf")
     if isinstance(obj, (np.integer, int)):
         return int(obj)
     if obj is None or isinstance(obj, str):

@@ -147,7 +147,10 @@ def test_an_eye_arm_numbered_differently_is_dropped_not_joined(tmp_path):
     assert set(provo.gaze["text_id"]) == {1}
     assert "word" not in provo.gaze.columns
     raw, _ = read_provo_csv(tmp_path / "Provo_Corpus-Predictability_Norms.csv")
-    assert g0_data_integrity(raw, provo).measured["arm_word_mismatches"] == 4
+    g = g0_data_integrity(raw, provo)
+    assert g.measured["arm_word_mismatches"] == 4
+    # Four of ten eye-tracked keys is far past the ten percent the gate allows.
+    assert not g.passed
 
 
 def test_an_eye_file_without_a_word_column_cannot_be_checked(tmp_path):
@@ -229,3 +232,38 @@ def test_subtlex_reads_a_real_frequency_file(tmp_path):
     assert np.isfinite(u("wordthatdoesnotexist"))
     assert u("wordthatdoesnotexist") <= u("aardvark")
     assert np.all(u.vector(["the", "unseen"]) > 0)
+
+
+def test_a_shifted_arm_drops_the_whole_tail_even_where_words_repeat(tmp_path, monkeypatch):
+    """"had had" makes a shifted arm agree at one number by accident, and that
+    key would carry a neighbour's reading time if only the disagreeing keys
+    were dropped."""
+    monkeypatch.setitem(PASSAGES, 3, ["He", "said", "had", "had", "been", "gone"])
+    _norms_rows().to_csv(tmp_path / "Provo_Corpus-Predictability_Norms.csv", index=False)
+    _eye_rows(shift=(3,)).to_csv(tmp_path / "Provo_Corpus-Eyetracking_Data.csv", index=False)
+    provo = load_provo(tmp_path, require_eye=True)
+    assert provo.arm_word_mismatches == len(PASSAGES[3])
+    assert 3 not in set(provo.gaze["text_id"])
+
+
+def test_a_blank_word_cell_is_dropped_with_a_warning(tmp_path, caplog):
+    """pandas would otherwise write the string "nan" into the passage."""
+    norms = _norms_rows()
+    norms.loc[norms["Word_Number"] == 4, "Word"] = ""
+    norms.to_csv(tmp_path / "Provo_Corpus-Predictability_Norms.csv", index=False)
+    _eye_rows().to_csv(tmp_path / "Provo_Corpus-Eyetracking_Data.csv", index=False)
+    with caplog.at_level("WARNING"):
+        provo = load_provo(tmp_path, require_eye=False)
+    assert "blank Word" in caplog.text
+    assert provo.passages[1][4] == ""
+    assert "nan" not in provo.passages[1]
+
+
+def test_a_blank_response_cell_loads_and_is_counted_by_the_gate(tmp_path):
+    norms = _norms_rows()
+    norms.loc[0, "Response"] = ""
+    norms.to_csv(tmp_path / "Provo_Corpus-Predictability_Norms.csv", index=False)
+    _eye_rows().to_csv(tmp_path / "Provo_Corpus-Eyetracking_Data.csv", index=False)
+    provo = load_provo(tmp_path, require_eye=False)
+    raw, _ = read_provo_csv(tmp_path / "Provo_Corpus-Predictability_Norms.csv")
+    assert g0_data_integrity(raw, provo).measured["empty_responses"] == 1

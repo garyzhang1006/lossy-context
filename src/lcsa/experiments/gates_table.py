@@ -40,17 +40,24 @@ def collect(out_dir, build_dir=None, gpu_hours: float | None = None,
     e2 = _load(out / "e2_summary.json") or {}
     e3 = _load(out / "e3_summary.json") or {}
     rel = _load(out / "reliability.json") or {}
+    # G0 is two records from the build: g0.json is the data-integrity gate
+    # taken before any GPU work (decode, join, arms) and g0_cache.json is the
+    # arithmetic check on the finished cache; the appendix row carries both.
+    g0_data = _load(build / "g0.json") if build else None
     g0 = _load(build / "g0_cache.json") if build else None
     g1 = _load(build / "g1.json") if build else None
-    if g0 is not None:
-        g0 = {"passed": g0.get("passed"), "measured": {k: v for k, v in g0.items()
-                                                       if k not in ("gate", "passed")}}
+    if g0 is not None or g0_data is not None:
+        measured = {k: v for k, v in (g0 or {}).items() if k not in ("gate", "passed")}
+        measured.update({k[2:]: v for k, v in (g0_data or {}).items() if k.startswith("m_")})
+        flags = [r.get("passed") for r in (g0, g0_data) if r is not None]
+        g0 = {"passed": all(bool(f) for f in flags), "measured": measured,
+              "threshold": (g0_data or {}).get("threshold", "")}
     if g1 is not None:
         g1 = {"passed": g1.get("passed"), "threshold": f">= {g1.get('threshold', 2.0)} TFLOP/s",
               "measured": {"tflops": g1.get("tflops"), "tokens_forwarded": g1.get("tokens_forwarded")}}
     human = e3.get("human") or {}
     rows = [
-        _row("G0", g0, "build/g0_cache.json"),
+        _row("G0", g0, "build/g0.json + g0_cache.json"),
         _row("G1", g1, "build/g1.json"),
         _row("G2", e1.get("g2"), "e1_summary.json"),
         _row("G3", rel.get("g3"), "reliability.json"),

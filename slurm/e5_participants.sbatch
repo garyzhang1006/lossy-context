@@ -6,7 +6,11 @@
 # part of the distributed norms; the job refuses to start without it rather
 # than fitting the pooled counts under a participant label.
 #
-#   sbatch --dependency=afterok:<lcsa-e3-prep id> --array=0-$E5_SHARDS slurm/e5_participants.sbatch
+#   POOL=$(sbatch --parsable --dependency=afterok:<lcsa-e3-prep id> --array=0 slurm/e5_participants.sbatch)
+#   sbatch --dependency=afterok:$POOL --array=1-$E5_SHARDS slurm/e5_participants.sbatch
+#
+# Two submissions, because the fits read the file task 0 writes: in a single
+# array they would start alongside it and exit on the missing pooled fit.
 #SBATCH --job-name=lcsa-e5-part
 #SBATCH --partition=scu-cpu
 #SBATCH --array=0-10

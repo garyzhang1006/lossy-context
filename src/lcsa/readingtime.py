@@ -35,6 +35,15 @@ __all__ = ["RTResult", "surprisal_from_corpus", "reading_time_gain", "spillover"
 
 @dataclass
 class RTResult:
+    """A held-out gain and the accounting behind it.
+
+    ``n_words`` is the number of held-out words actually scored, which is the
+    denominator of ``gain_per_word`` and of the two per-word log-likelihoods; a
+    fold too small to train on contributes nothing to any of them.  ``estimator``
+    names what both arms were fitted with, and reads ``MixedLM+OLS`` when some
+    folds degraded and others did not.
+    """
+
     gain_per_word: float
     baseline_ll: float
     full_ll: float
@@ -66,19 +75,38 @@ def surprisal_from_corpus(corpus, theta, model, kernel=None) -> np.ndarray:
     return out
 
 
-def spillover(x: np.ndarray, passage: np.ndarray, lag: int = 1) -> np.ndarray:
+def spillover(x: np.ndarray, passage: np.ndarray, lag: int = 1,
+              position: np.ndarray | None = None) -> np.ndarray:
     """Value from ``lag`` words earlier within the same passage, ``nan`` at the edge.
 
     Spillover is standard in reading-time models and is included because omitting
     it inflates the apparent contribution of the current word's surprisal.
+
+    With ``position`` (the word number inside the passage) the lag is taken by
+    word number, so a word missing from ``x`` leaves its successor's spillover
+    ``nan`` instead of quietly promoting the word before it.  Without it the lag
+    is positional, which is correct only when the rows are every word of the
+    passage in order.
     """
     x = np.asarray(x, dtype=np.float64)
     passage = np.asarray(passage)
     out = np.full(x.size, np.nan, dtype=np.float64)
-    for p in np.unique(passage):
-        idx = np.flatnonzero(passage == p)
-        if idx.size > lag:
-            out[idx[lag:]] = x[idx[:-lag]]
+    if position is None:
+        for p in np.unique(passage):
+            idx = np.flatnonzero(passage == p)
+            if idx.size > lag:
+                out[idx[lag:]] = x[idx[:-lag]]
+        return out
+    position = np.asarray(position)
+    if position.size != x.size:
+        raise ValueError(
+            f"position has {position.size} entries but x has {x.size}"
+        )
+    at = {(p, int(w)): i for i, (p, w) in enumerate(zip(passage, position))}
+    for i, (p, w) in enumerate(zip(passage, position)):
+        j = at.get((p, int(w) - lag))
+        if j is not None:
+            out[i] = x[j]
     return out
 
 
@@ -121,29 +149,34 @@ def reading_time_gain(
     n_folds: int = 5,
     use_mixed: bool = True,
     seed: int = 0,
+    position: np.ndarray | None = None,
 ) -> RTResult:
     """Held-out per-word log-likelihood gain from adding the lossy-context term.
 
     Baseline predictors: the controls plus full-context surprisal and its
     one-word spillover.  The comparison model adds lossy-context surprisal and
     its spillover.  Folds partition passages, so no passage appears in both
-    training and evaluation.
+    training and evaluation.  ``position`` is the word number inside the
+    passage, and is passed to :func:`spillover` so the lag survives words that
+    the build dropped.
+
+    Both arms of a fold are fitted with the same estimator: a gain read off a
+    mixed baseline and an OLS comparison would be the difference between two
+    likelihoods on different scales.
     """
     y = np.asarray(gaze, dtype=np.float64)
     passage = np.asarray(passage)
     base_cols = [
         np.ones(y.size),
         np.asarray(surprisal_full, dtype=np.float64),
-        spillover(surprisal_full, passage),
+        spillover(surprisal_full, passage, position=position),
     ]
     ctrl = np.atleast_2d(np.asarray(controls, dtype=np.float64))
     if ctrl.shape[0] != y.size:
         ctrl = ctrl.T
     base = np.column_stack(base_cols + [ctrl])
-    extra = np.column_stack(
-        [np.asarray(surprisal_lossy, dtype=np.float64),
-         spillover(np.asarray(surprisal_lossy, dtype=np.float64), passage)]
-    )
+    lossy = np.asarray(surprisal_lossy, dtype=np.float64)
+    extra = np.column_stack([lossy, spillover(lossy, passage, position=position)])
     full = np.column_stack([base, extra])
 
     ok = np.isfinite(y) & np.isfinite(base).all(axis=1) & np.isfinite(full).all(axis=1)
@@ -157,24 +190,43 @@ def reading_time_gain(
     rng.shuffle(uniq)
     folds = np.array_split(uniq, min(n_folds, uniq.size))
     ll_b = ll_f = 0.0
-    est, conv = "OLS", True
+    n_eval = n_skipped = 0
+    used: list[str] = []
+    conv = True
     for f in folds:
         te = np.isin(passage, f)
         tr = ~te
         if tr.sum() < base.shape[1] + 3 or te.sum() == 0:
+            n_skipped += 1
             continue
-        bb, sb, est, cb = _fit_ll(y[tr], base[tr], passage[tr], use_mixed)
-        bf, sf, est, cf = _fit_ll(y[tr], full[tr], passage[tr], use_mixed)
+        bb, sb, eb, cb = _fit_ll(y[tr], base[tr], passage[tr], use_mixed)
+        bf, sf, ef, cf = _fit_ll(y[tr], full[tr], passage[tr], use_mixed and eb == "MixedLM")
+        if ef != eb:
+            # The comparison arm degraded, so the baseline is refitted the same
+            # way; only the arms' difference is reported and it has to be a
+            # difference between two log-likelihoods of the same model class.
+            bb, sb, eb, cb = _fit_ll(y[tr], base[tr], passage[tr], False)
         conv = conv and cb and cf
+        used.append(eb)
+        n_eval += int(te.sum())
         ll_b += _gauss_ll(y[te], base[te], bb, sb)
         ll_f += _gauss_ll(y[te], full[te], bf, sf)
-    n = int(y.size)
+    if n_eval == 0:
+        return RTResult(float("nan"), float("nan"), float("nan"), 0, len(folds),
+                        "none", False, "every fold was too small to train on")
+    est = "+".join(sorted(set(used)))
+    notes = []
+    if n_skipped:
+        notes.append(f"{n_skipped} of {len(folds)} folds skipped as too small")
+    if len(set(used)) > 1:
+        notes.append(f"{used.count('OLS')} of {len(used)} folds fell back to OLS")
     return RTResult(
-        gain_per_word=float((ll_f - ll_b) / n),
-        baseline_ll=float(ll_b / n),
-        full_ll=float(ll_f / n),
-        n_words=n,
+        gain_per_word=float((ll_f - ll_b) / n_eval),
+        baseline_ll=float(ll_b / n_eval),
+        full_ll=float(ll_f / n_eval),
+        n_words=n_eval,
         n_folds=len(folds),
         estimator=est,
         converged=conv,
+        note="; ".join(notes),
     )

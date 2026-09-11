@@ -4,10 +4,10 @@ L-BFGS-B with the analytic gradient of :mod:`lcsa.likelihood`, box constraints
 from ``Model.bounds`` and multiple starts.  Two behaviours matter for the
 paper's honesty and are implemented deliberately rather than incidentally.
 
-First, a fit that lands on the ``delta`` upper bound is reported as *at bound*
-rather than silently as a point estimate, because a boundary fit is the visible
-form of an unidentified direction and dropping it would bias the bootstrap
-toward the paper's own prediction.
+First, a fit that lands on either end of the ``delta`` box is reported as *at
+bound* rather than silently as a point estimate, because a boundary fit is the
+visible form of an unidentified direction and dropping it would bias the
+bootstrap toward the paper's own prediction.
 
 Second, the profile region is computed on a fixed log-spaced grid with every
 other parameter re-optimised at each point, and a region that reaches either end
@@ -38,6 +38,17 @@ _BOUND_TOL = 1e-4
 
 @dataclass
 class FitResult:
+    """A fit and the flags that say how much of it is a point estimate.
+
+    ``at_bound`` means the estimated ``delta`` landed on *either* end of its box,
+    within ``_BOUND_TOL``: on ``delta_max``, where the data cannot distinguish
+    decay rates any faster, or on zero, where the null sits on the edge of the
+    parameter space.  Both are boundary fits whose standard error and Wald
+    interval mean nothing, and both are reported rather than passed off as
+    interior estimates.  It is ``False`` whenever ``delta`` was pinned by
+    ``fixed``, since a pinned value is an input and not an estimate.
+    """
+
     theta: np.ndarray
     loglik: float
     success: bool
@@ -179,7 +190,9 @@ def fit(
             "check the cache for zero rows or a mismatched candidate set"
         )
     theta, L, ok, msg = best
-    at_bound = (0 not in fixed) and (theta[0] >= delta_max - _BOUND_TOL)
+    at_bound = (0 not in fixed) and (
+        theta[0] >= delta_max - _BOUND_TOL or theta[0] <= _BOUND_TOL
+    )
     return FitResult(
         theta=theta,
         loglik=L,
@@ -228,7 +241,8 @@ def default_grid(n: int = 21, lo: float = 1e-3, hi: float = 2.0) -> np.ndarray:
 
 
 def local_grid(delta_hat: float, se: float | None = None, n: int = 9,
-               k: float = 6.0, span: float = 4.0) -> np.ndarray:
+               k: float = 6.0, span: float = 4.0,
+               delta_max: float = _DELTA_MAX) -> np.ndarray:
     """A short grid around ``delta_hat``, with an exact zero prepended.
 
     Coverage replicates cannot afford 21 constrained fits each, and a fixed grid
@@ -238,20 +252,25 @@ def local_grid(delta_hat: float, se: float | None = None, n: int = 9,
     side of the estimate and always contains it, which is where the deviance
     actually crosses the threshold.  Without one it falls back to a
     multiplicative span, and with no usable estimate at all to the default grid.
+    Points are clipped into ``[0, delta_max]``, the box the constrained fits are
+    run in: a grid point outside it would be silently pulled back to the bound by
+    the optimiser and then reported at its own nominal delta.
     """
     d = float(delta_hat)
     if not np.isfinite(d) or d < 0:
         return default_grid(n=n)
+    hi_box = float(delta_max)
+    d = min(d, hi_box)
     m = max(int(n) - 1, 3)
     if se is not None and np.isfinite(se) and se > 0:
         lo = max(0.0, d - k * float(se))
-        hi = d + k * float(se)
+        hi = min(hi_box, d + k * float(se))
         g = np.linspace(lo, hi, m)
     elif d > 0:
-        g = np.geomspace(d / span, d * span, m)
+        g = np.geomspace(d / span, min(hi_box, d * span), m)
     else:
         return default_grid(n=n)
-    g = np.unique(np.concatenate(([0.0, d], g)))
+    g = np.unique(np.clip(np.concatenate(([0.0, d], g)), 0.0, hi_box))
     return g
 
 
@@ -300,8 +319,9 @@ def profile_interval(
 
     ``scale`` carries the cluster-robust correction: with 55 clusters the naive
     profile is too narrow by the same factor the score test's denominator
-    corrects, and passing ``scale < 1`` widens the region accordingly.  Interval
-    endpoints are found by linear interpolation of the deviance between grid
+    corrects, and passing ``scale < 1`` widens the region accordingly.  The
+    region returned is the connected run of accepted grid points around the
+    maximum; its endpoints are found by interpolating the deviance between grid
     points, and a region touching either end of the grid is flagged rather than
     truncated.
     """
@@ -314,16 +334,26 @@ def profile_interval(
     cut = chi2.ppf(level, 1)
     # The reference is the unconstrained maximum when the caller has it: on a
     # coarse grid the grid maximum sits below it, and anchoring there shifts the
-    # whole region toward the nearest grid point.
+    # whole region toward the nearest grid point.  The best grid point is raised
+    # to carry that maximum, since leaving it low would offset the whole deviance
+    # curve and can empty the region outright; on a noisy profile that point can
+    # sit a grid step from ``delta_hat``, which widens the region by that step.
+    i_peak = int(np.argmax(vals))
     Lmax = float(vals.max()) if max_loglik is None else max(float(max_loglik), float(vals.max()))
+    if Lmax > vals[i_peak]:
+        vals = vals.copy()
+        vals[i_peak] = Lmax
     dev = 2.0 * float(scale) * (Lmax - vals)
     inside = dev <= cut
-    if not inside.any():
-        # Numerically possible only if the maximum itself is excluded, which
-        # cannot happen since dev == 0 there; guard anyway.
-        raise RuntimeError("empty profile region; the deviance curve is degenerate")
-    idx = np.flatnonzero(inside)
-    i0, i1 = int(idx[0]), int(idx[-1])
+    # The region is the connected run of accepted points around the maximum: a
+    # far grid point that dips back under the threshold is a second mode or a
+    # constrained fit that stopped short, and swallowing the gap between them
+    # would report an interval over deltas the profile itself rejected.
+    i0 = i1 = i_peak
+    while i0 > 0 and inside[i0 - 1]:
+        i0 -= 1
+    while i1 < g.size - 1 and inside[i1 + 1]:
+        i1 += 1
 
     def cross(a: int, b: int) -> float:
         """Where the deviance crosses ``cut`` between grid points ``a`` and ``b``.

@@ -525,7 +525,7 @@ def implied_bias(
     return {
         "delta_first_order": float(d1),
         "delta_first_order_lo": float(lo), "delta_first_order_hi": float(hi),
-        "d_half_first_order": float(d_half_from_delta(d1)) if d1 > 0 else float("inf"),
+        "d_half_first_order": float(d_half_from_delta(d1, kernel=kernel)) if d1 > 0 else float("inf"),
         "inner_eff": full.inner_eff, "info_eff": full.info_eff,
         "alignment": full.alignment,
         "n_boot": int(n_boot), "n_boot_usable": int(ok.sum()),

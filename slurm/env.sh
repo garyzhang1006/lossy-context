@@ -25,7 +25,9 @@ if [ -z "${HF_TOKEN:-}" ]; then
     for f in "$HF_HOME/token" "$HOME/.cache/huggingface/token"; do
         [ -s "$f" ] || continue
         HF_TOKEN="$(tr -d " \t\n\r" < "$f")"
-        break
+        # A file of whitespace alone is not a token and must not hide the
+        # second path.
+        [ -n "$HF_TOKEN" ] && break
     done
 fi
 if [ -n "${HF_TOKEN:-}" ]; then export HF_TOKEN; else unset HF_TOKEN; fi

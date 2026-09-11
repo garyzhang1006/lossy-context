@@ -205,10 +205,13 @@ dependants pending and `scancel` clears them. The one exception is
 `refsweep.sbatch`, which `merge.sbatch` joins with `afterany`, because the
 sweep feeds one appendix table and a checkpoint that ran out of memory or was
 never fetched should drop out of that table rather than cancel the merge. `build.sbatch` and
-`build_refs.sbatch` skip a build whose `cache.npz` exists, so resubmitting
-after a partial run costs only the smoke pass. `N_REP`, `N_BOOT` and the
-shard counts are read from the environment, so
-`N_REP=20 N_BOOT=20 E2_SHARDS=2 E3_SHARDS=2 E3_BOOT_SHARDS=2 E4_SHARDS=2 bash slurm/pipeline.sh`
+`build_refs.sbatch` skip a build whose `g0_cache.json`, the last file a build
+writes, exists, so resubmitting after a partial run costs only the smoke pass
+and a build that died between the cache and its gate is redone. A build whose
+G0 gate fails writes `g0_cache_failed.json` instead and exits non-zero, so a
+resubmission rebuilds it rather than taking the rejected cache as finished. `N_REP`,
+`N_BOOT` and the shard counts are read from the environment, so
+`N_REP=20 N_BOOT=20 E2_SHARDS=2 E3_SHARDS=2 E3_BOOT_SHARDS=2 E4_SHARDS=2 E6_SHARDS=2 E5_SHARDS=2 bash slurm/pipeline.sh`
 exercises every stage at a fraction of the registered cost. A shard that
 failed can be resubmitted alone with the same `--rep-start` and `--rep-stop`
 and `merge.sbatch` rerun; the replicate seeding guarantees the same rows.

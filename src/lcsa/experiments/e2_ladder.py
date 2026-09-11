@@ -99,10 +99,10 @@ def fit_rung(
     scale = 1.0 / deff if np.isfinite(deff) and deff > 0 else 1.0
     row = {
         "d_half_true": float(d_half),
-        "delta_true": float(delta_from_d_half(d_half)),
+        "delta_true": float(delta_from_d_half(d_half, kernel=kernel)),
         "estimator": model.name,
         "delta_hat": float(f.delta),
-        "d_half_hat": float(d_half_from_delta(f.delta)) if f.delta > 0 else float("inf"),
+        "d_half_hat": float(d_half_from_delta(f.delta, kernel=kernel)) if f.delta > 0 else float("inf"),
         "loglik": float(f.loglik),
         "converged": bool(f.success),
         "at_bound": bool(f.at_bound),
@@ -120,11 +120,11 @@ def fit_rung(
         row.update({
             "delta_lo": float(reg.lo), "delta_hi": float(reg.hi),
             "unbounded_lo": bool(reg.unbounded_lo), "unbounded_hi": bool(reg.unbounded_hi),
-            "d_half_lo": float(d_half_from_delta(reg.hi)) if reg.hi > 0 else float("inf"),
-            "d_half_hi": float(d_half_from_delta(reg.lo)) if reg.lo > 0 else float("inf"),
+            "d_half_lo": float(d_half_from_delta(reg.hi, kernel=kernel)) if reg.hi > 0 else float("inf"),
+            "d_half_hi": float(d_half_from_delta(reg.lo, kernel=kernel)) if reg.lo > 0 else float("inf"),
             "covers_truth": bool(
-                (reg.lo <= delta_from_d_half(d_half) <= reg.hi)
-                or (reg.unbounded_hi and delta_from_d_half(d_half) >= reg.lo)
+                (reg.lo <= delta_from_d_half(d_half, kernel=kernel) <= reg.hi)
+                or (reg.unbounded_hi and delta_from_d_half(d_half, kernel=kernel) >= reg.lo)
             ),
         })
     return row

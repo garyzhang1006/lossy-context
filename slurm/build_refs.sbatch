@@ -36,7 +36,9 @@ read -ra REFS <<< "$LCSA_REFS"
     exit 2; }
 MODEL="${REFS[$SLURM_ARRAY_TASK_ID]}"
 OUT=$(ref_dir "$MODEL")
-if [ -f "$OUT/cache.npz" ]; then echo "$OUT/cache.npz exists; remove it to rebuild"; exit 0; fi
+# As in build.sbatch: the gate record is written last, so it is the mark of a
+# finished build; a cache without it came from a job that died mid-way.
+if [ -f "$OUT/g0_cache.json" ]; then echo "$OUT/g0_cache.json exists, so this build finished; remove $OUT to rebuild"; exit 0; fi
 require_prefetched "$MODEL"
 python -c 'import torch; assert torch.cuda.is_available(), "no CUDA device visible"'
 lcsa --verbose build --provo-dir "$LCSA_PROVO" --subtlex "$LCSA_SUBTLEX" \

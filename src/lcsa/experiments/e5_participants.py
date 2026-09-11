@@ -135,7 +135,7 @@ def fit_participants(corpus: Corpus, counts: dict[str, list[np.ndarray]], theta_
                     "delta_pinned": float(fp.delta), "at_bound_pinned": bool(fp.at_bound),
                     "delta_free": float(ff.delta), "at_bound_free": bool(ff.at_bound),
                     "converged_free": bool(ff.success),
-                    "d_half_pinned": float(d_half_from_delta(fp.delta)) if fp.delta > 0 else float("inf"),
+                    "d_half_pinned": float(d_half_from_delta(fp.delta, kernel=kernel)) if fp.delta > 0 else float("inf"),
                     "delta_half_a": float(fA.delta), "delta_half_b": float(fB.delta),
                     "failed": False,
                 })
@@ -163,7 +163,10 @@ def summarise(rows: list[dict], external: dict[str, float] | None = None) -> lis
         df_ = np.array([r["delta_free"] for r in ok])
         a = np.array([r["delta_half_a"] for r in ok]); b = np.array([r["delta_half_b"] for r in ok])
         r_half = float(spearmanr(a, b).statistic) if len(ok) > 3 else float("nan")
-        log_dh = np.log([d_half_from_delta(x) for x in dp if x > 0]) if np.any(dp > 0) else np.array([])
+        # The rows carry the half-life under the kernel they were fitted with,
+        # which this summary does not otherwise know.
+        log_dh = (np.log([r["d_half_pinned"] for r in ok if r["delta_pinned"] > 0])
+                  if np.any(dp > 0) else np.array([]))
         row = {
             "estimator": est, "n_participants": len(ok),
             "n_failed": sum(1 for r in rows if r["estimator"] == est and r.get("failed")),
@@ -213,8 +216,11 @@ def assemble(rows: list[dict], out_dir, external=None) -> dict:
     return res
 
 
-def merge(out_dir, external=None) -> dict:
-    return assemble(denull(read_shards(out_dir, "e5_participants")), out_dir, external)
+def merge(out_dir, external=None, n_part: int | None = None) -> dict:
+    """``n_part`` is the participant count the array tiled; a shard that never
+    ran would otherwise shrink the audit to whoever happened to finish."""
+    return assemble(read_shards(out_dir, "e5_participants", n_required=n_part),
+                    out_dir, external)
 
 
 def pooled_theta(corpus: Corpus, models, kernel=POWER, seed: int = 0) -> dict[str, list[float]]:

@@ -340,8 +340,18 @@ class ReferenceScorer:
             self._resolved = "simple"
             return self._resolved
         if probe_trie is None:
-            ids = [self.tok.encode(w, add_special_tokens=False) for w in ["the", "a", "an", "and"]]
-            probe_trie = build_trie(ids, ["the", "a", "an", "and"])
+            # The packed forward's own risk is the position ids and attention
+            # mask of the nodes below the root; a probe of single-token words
+            # evaluates the root alone and would pass whatever they were.
+            # The long words split under every tokenizer the build accepts,
+            # and the space matches how the build encodes a candidate.
+            words = ["the", "a", "an", "and", "unbelievably", "counterintuitively",
+                     "photosynthesising", "antidisestablishmentarianism"]
+            ids = [self.tok.encode(" " + w, add_special_tokens=False) for w in words]
+            probe_trie = build_trie(ids, words)
+        if probe_trie.max_depth() < 2:
+            log.warning("the probe trie has no node below the root, so the packed path "
+                        "check covers the first token position alone")
         prefix = self._prefix_ids("the quick brown fox jumps over the lazy")
         try:
             a = self._simple_nodes(prefix, probe_trie)

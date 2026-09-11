@@ -116,7 +116,7 @@ later. Then:
    a marker that puts every later job in offline mode, because twenty-seven
    tasks hitting the Hub at once from a shared cluster address collects HTTP
    429s. Before that, run the chain once at smoke size to prove the plumbing:
-   `N_REP=20 N_BOOT=20 E2_SHARDS=2 E3_SHARDS=2 E3_BOOT_SHARDS=2 E4_SHARDS=2 E6_SHARDS=2 bash slurm/pipeline.sh`
+   `N_REP=20 N_BOOT=20 E2_SHARDS=2 E3_SHARDS=2 E3_BOOT_SHARDS=2 E4_SHARDS=2 E6_SHARDS=2 E5_SHARDS=2 bash slurm/pipeline.sh`
    exercises every stage for a fraction of the cost. The registered run is the
    same command with no variables set.
 5. Watch it with `squeue -u $USER` and read logs under

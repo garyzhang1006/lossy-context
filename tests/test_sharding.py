@@ -258,3 +258,52 @@ def test_cli_runs_the_linear_kernel_end_to_end(null_corpus, tmp_path):
     with pytest.raises(SystemExit, match="kernel"):
         main(["e2", "--cache", str(cache), "--out", str(out), "--estimators", "naive",
               "--stage", "coverage", "--n-rep", "1", "--rep-start", "0", "--rep-stop", "1"])
+
+
+def test_shards_round_trip_infinity_rather_than_nulling_it(tmp_path):
+    """An infinite half-life is the ladder's top rung; written as null it would
+    read back as nan and drop out of every sharded median."""
+    write_shard(tmp_path, "w", range(0, 1),
+                [{"replicate": 0, "up": float("inf"), "down": -np.inf, "hole": np.nan}])
+    row = read_shards(tmp_path, "w")[0]
+    assert row["up"] == np.inf and row["down"] == -np.inf and np.isnan(row["hole"])
+    raw = json.loads(next((tmp_path / "shards").glob("w_*.json")).read_text())
+    assert raw["rows"][0]["up"] == "inf"
+
+
+def test_prediction_8_ignores_a_reference_whose_sweep_selected_nothing():
+    sweeps = {"a": {"argmax_k": 2}, "b": {"argmax_k": None}, "c": {"argmax_k": float("nan")},
+              "d": {"argmax_k": 8.0}}
+    res = e4._prediction_8(sweeps)
+    assert res["selected_k"] == [2, 8]
+    assert res["max_min_ratio"] == 4.0 and res["supported"]
+
+
+def test_the_ladder_reports_its_rung_under_the_kernel_it_fitted(corpus):
+    """The half-life converters were power-only, so a linear-kernel ladder
+    stamped every row with a power-kernel delta_true and covered the wrong
+    truth."""
+    from lcsa.kernels import LINEAR, delta_from_d_half
+
+    theta0 = fit_constrained(corpus, NAIVE, n_starts=1).theta
+    row = e2.fit_rung(corpus, corpus, 4.0, theta0, NAIVE, LINEAR, seed=0, profile=False)
+    assert row["delta_true"] == delta_from_d_half(4.0, kernel=LINEAR)
+    assert row["delta_true"] != delta_from_d_half(4.0)
+
+
+def test_e4_takes_the_spillover_lag_by_word_number_when_told_the_positions(corpus):
+    """A target the build dropped leaves a hole; lagging over the retained rows
+    would hand its successor the surprisal of the word before the hole."""
+    rng = np.random.default_rng(5)
+    passage = np.array([t.cluster for t in corpus])
+    # Word numbers (the targets of a passage are interleaved with the others'),
+    # with a hole after the first word of the first passage.
+    position = np.array([int((passage[:i] == p).sum()) for i, p in enumerate(passage)])
+    position[passage == passage[0]] += (position[passage == passage[0]] >= 1)
+    y = 250 + rng.normal(0, 25, len(corpus))
+    ctrl = rng.normal(size=(len(corpus), 2))
+    s = e4.window_surprisal(corpus, 2)
+    by_row = e4.heldout_delta_ll(y, ctrl, s, passage, 2, False, 0)
+    by_word = e4.heldout_delta_ll(y, ctrl, s, passage, 2, False, 0, position=position)
+    assert np.isfinite(by_row) and np.isfinite(by_word)
+    assert by_row != by_word

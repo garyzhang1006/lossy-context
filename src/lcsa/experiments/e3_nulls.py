@@ -375,8 +375,15 @@ def summarise_contrast(reps: list[dict], names, margin: float = 0.25) -> dict:
     A replicate where either arm hits the boundary has an undefined log
     difference; it is counted and excluded, never replaced by a number.
     """
-    res = {"n_boot": int(len(reps)), "n_usable_replicates": len(reps), "contrasts": {}}
     hs = np.array([r.get("human", np.nan) for r in reps], dtype=np.float64)
+    arms = [np.array([r.get(nm, np.nan) for r in reps], dtype=np.float64) for nm in names]
+    usable = np.isfinite(hs)
+    for ns in arms:
+        usable &= np.isfinite(ns)
+    # Replicates on which every contrast is defined; the per-contrast counts
+    # below are the ones each TOST actually used.
+    res = {"n_boot": int(len(reps)), "n_usable_replicates": int(usable.sum()),
+           "contrasts": {}}
     for nm in names:
         ns = np.array([r.get(nm, np.nan) for r in reps], dtype=np.float64)
         with np.errstate(divide="ignore", invalid="ignore"):

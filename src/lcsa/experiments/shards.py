@@ -49,12 +49,19 @@ def write_shard(out_dir, stem: str, reps: range, rows: list[dict]) -> Path:
 
 
 def denull(obj):
-    """Undo the one lossy step of JSON: ``None`` in a numeric slot becomes ``nan``."""
+    """Undo the lossy step of JSON: ``None`` becomes ``nan`` and the strings
+    ``jsonable`` wrote for the infinities become infinities again."""
     if isinstance(obj, dict):
         return {k: denull(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [denull(v) for v in obj]
-    return math.nan if obj is None else obj
+    if obj is None:
+        return math.nan
+    if obj == "inf":
+        return math.inf
+    if obj == "-inf":
+        return -math.inf
+    return obj
 
 
 def read_shards(out_dir, stem: str, n_required: int | None = None) -> list[dict]:

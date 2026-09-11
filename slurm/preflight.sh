@@ -83,8 +83,26 @@ if [ -n "$GATED" ]; then
 fi
 
 echo "design"
+# The same check pipeline.sh makes at submit time, here so that a smoke pass
+# with a shard count above its replicate count fails before anything is queued.
+while read -r var total; do
+    if [ "${!var}" -ge 1 ] && [ "${!var}" -le "$total" ]; then ok "$var=${!var} tiles $total"
+    else bad "$var=${!var} must be between 1 and the $total replicates it tiles"; fi
+done <<EOF
+E2_SHARDS $N_REP
+E3_SHARDS $N_REP
+E6_SHARDS $N_REP
+E3_BOOT_SHARDS $N_BOOT
+E4_SHARDS $N_BOOT
+E5_SHARDS $N_PART
+EOF
 NREADERS=$(set -- $E3_READERS; echo $#)
-TASKS=$(( E2_SHARDS + NREADERS * E3_SHARDS + E3_BOOT_SHARDS + 1 + E4_SHARDS + E6_SHARDS ))
+NREFS=$(set -- $LCSA_REFS; echo $#)
+NSWEEP=$(set -- $LCSA_SWEEP_REFS; echo $#)
+HAVE_PART=0
+if [ -n "${LCSA_PARTICIPANTS:-}" ] && [ -f "$LCSA_PARTICIPANTS" ]; then HAVE_PART=1; fi
+TASKS=$(( E2_SHARDS + NREADERS * E3_SHARDS + E3_BOOT_SHARDS + 1 + E4_SHARDS + E6_SHARDS
+          + NREFS + NSWEEP + HAVE_PART * (E5_SHARDS + 1) ))
 [ "$TASKS" -le "$LCSA_MAX_RUNNING" ] \
     && ok "$TASKS array tasks, under the $LCSA_MAX_RUNNING the QOS runs at once" \
     || note "$TASKS array tasks; QOS normal runs $LCSA_MAX_RUNNING at a time and queues the rest"

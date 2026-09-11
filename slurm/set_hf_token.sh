@@ -21,7 +21,11 @@ if [ -t 0 ]; then
 else
     # Piped in, for the case where the token already sits in a password manager:
     #   pass show hf/read | bash slurm/set_hf_token.sh
-    IFS= read -r TOKEN
+    # `read` returns 1 at end of file even when it filled the variable, which
+    # is what `printf '%s' "$TOKEN" |` produces, and set -e would then exit
+    # with nothing written and nothing said; the emptiness check below is
+    # the one that reports.
+    IFS= read -r TOKEN || true
 fi
 TOKEN="$(printf '%s' "$TOKEN" | tr -d " \t\n\r")"
 

@@ -54,3 +54,12 @@ def test_fit_and_summarise_run_on_synthetic_participants():
     assert summ[0]["n_participants"] == len(counts)
     assert np.isfinite(summ[0]["median_delta_pinned"])
     assert summ[0]["n_external_shared"] == 5
+
+
+def test_merge_refuses_shards_that_stop_short_of_the_declared_participants(tmp_path):
+    """A shard that never ran would otherwise shrink the audit to whoever finished."""
+    from lcsa.experiments.shards import write_shard
+
+    write_shard(tmp_path, "e5_participants", range(0, 3), [{"replicate": i} for i in range(3)])
+    with pytest.raises(ValueError, match="3"):
+        e5.merge(tmp_path, n_part=5)

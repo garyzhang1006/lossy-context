@@ -101,3 +101,48 @@ def test_negative_delta_is_refused():
     """A negative delta means retention rising with distance, which is not in the family."""
     with pytest.raises(ValueError):
         truncation_weights(5, -0.1)
+
+
+def test_linear_gradient_is_minus_d_wherever_the_weight_is_positive():
+    """``r = 1 - delta d`` while positive, so ``dr/d(delta) = -d`` there, zero included.
+
+    At ``delta = 0`` the weight is positive at every distance, and a derivative
+    that vanished there would leave a fit started at zero with no gradient.
+    """
+    d = np.arange(0, 12, dtype=np.float64)
+    assert d_retention_d_delta(d, 0.0, LINEAR) == pytest.approx(-d)
+    inside = np.arange(0, 6, dtype=np.float64)
+    assert d_retention_d_delta(inside, 0.1, LINEAR) == pytest.approx(-inside)
+
+
+def test_linear_gradient_at_zero_matches_a_one_sided_difference():
+    """Negative delta is outside the family, so the check at zero is one-sided."""
+    d = np.arange(0, 9, dtype=np.float64)
+    eps = 1e-7
+    fd = (LINEAR(d, eps) - LINEAR(d, 0.0)) / eps
+    assert np.max(np.abs(d_retention_d_delta(d, 0.0, LINEAR) - fd)) < 1e-6
+
+
+def test_linear_weight_gradient_at_zero_is_not_identically_zero():
+    """The atom weights move off ``delta = 0``, so their derivative must say so."""
+    dw = d_truncation_weights(10, 0.0, LINEAR)
+    assert np.max(np.abs(dw)) > 0.5
+    assert abs(dw.sum()) < 1e-12
+    eps = 1e-7
+    fd = (truncation_weights(10, eps, LINEAR) - truncation_weights(10, 0.0, LINEAR)) / eps
+    assert np.max(np.abs(dw - fd)) < 1e-5
+
+
+@pytest.mark.parametrize("d_half", [2.0, 8.0, 32.0, 128.0])
+def test_linear_d_half_round_trip(d_half):
+    """``r(d_half) = 1/2`` under the linear kernel means ``delta = 1/(2 d_half)``."""
+    delta = delta_from_d_half(d_half, LINEAR)
+    assert retention(np.array([d_half]), delta, LINEAR)[0] == pytest.approx(0.5, rel=1e-12)
+    assert d_half_from_delta(delta, LINEAR) == pytest.approx(d_half, rel=1e-12)
+
+
+def test_d_half_converters_default_to_the_power_kernel():
+    assert delta_from_d_half(8.0) == delta_from_d_half(8.0, POWER)
+    assert d_half_from_delta(0.316) == d_half_from_delta(0.316, POWER)
+    assert delta_from_d_half(float("inf"), LINEAR) == 0.0
+    assert np.isinf(d_half_from_delta(0.0, LINEAR))

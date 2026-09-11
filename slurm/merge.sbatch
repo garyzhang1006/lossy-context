@@ -17,7 +17,7 @@ OUT="$LCSA_ART"
 # writes scorecard.csv from the registered thresholds.  MERGE_ALLOW_MISSING
 # names legs recorded as "not run" on the scorecard, never silently dropped.
 lcsa register --out "$OUT" --check
-lcsa merge --out "$OUT" --legs "${MERGE_LEGS:-e2,e3,e4,e6}" \
+lcsa merge --out "$OUT" --legs "${MERGE_LEGS:-e2,e3,e4,e6}" --n-participants "$N_PART" \
     ${MERGE_ALLOW_MISSING:+--allow-missing "$MERGE_ALLOW_MISSING"}
 cat "$OUT/scorecard.csv"
 for f in e2_coverage e3_rejection_rates confounds e6_panel e5_summary; do

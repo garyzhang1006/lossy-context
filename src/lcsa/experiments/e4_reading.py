@@ -39,8 +39,11 @@ def gaze_table(provo, keys, unigrams=None, measure: str = "gaze"):
     """Align the eye-tracking arm to the built targets.
 
     Returns the mean gaze duration per target, the control matrix (log unigram
-    frequency and word length) and the passage label, in the corpus's own target
-    order.  A target with no eye-tracking record becomes ``nan`` and is dropped
+    frequency and word length), the passage label and the word number, in the
+    corpus's own target order.  The word number is what the spillover lag is
+    taken by: a target the build dropped leaves a hole in the passage, and a
+    lag over the retained rows alone would hand its successor the surprisal of
+    the word before the hole.  A target with no eye-tracking record becomes ``nan`` and is dropped
     downstream rather than imputed, because imputing a reading time is inventing
     the measurement the whole leg rests on.
     """
@@ -59,16 +62,18 @@ def gaze_table(provo, keys, unigrams=None, measure: str = "gaze"):
            zip(agg["text_id"], agg["word_number"], agg["y"])}
     wmap = {(int(r.text_id), int(r.word_number)): str(r.word)
             for r in provo.words.itertuples()}
-    y, ctrl, passage = [], [], []
+    y, ctrl, passage, position = [], [], [], []
     for tid, wn in keys:
         y.append(lut.get((int(tid), int(wn)), np.nan))
         w = wmap.get((int(tid), int(wn)), "")
         lf = float(unigrams(w)) if unigrams is not None else 0.0
         ctrl.append([lf, float(len(w))])
         passage.append(int(tid))
+        position.append(int(wn))
     return (np.asarray(y, dtype=np.float64),
             np.asarray(ctrl, dtype=np.float64),
-            np.asarray(passage))
+            np.asarray(passage),
+            np.asarray(position))
 
 
 def window_surprisal(corpus: Corpus, k: int, P_override=None) -> np.ndarray:
@@ -105,8 +110,12 @@ def heldout_delta_ll(
     n_folds: int | None = None,
     use_mixed: bool = True,
     seed: int = 0,
+    position: np.ndarray | None = None,
 ) -> float:
     """Held-out log-likelihood gain from adding one predictor and its spillover.
+
+    ``position`` is the word number of each row inside its passage; with it the
+    spillover is lagged by word number rather than by row, see ``spillover``.
 
     ``n_folds=None`` means leave one passage out, which is what the registered
     selection rule specifies; folds partition passages so no passage is ever in
@@ -119,7 +128,7 @@ def heldout_delta_ll(
         ctrl = ctrl.T
     base = np.column_stack([np.ones(y.size), ctrl])
     x = np.asarray(predictor, dtype=np.float64)
-    full = np.column_stack([base, x, spillover(x, passage)])
+    full = np.column_stack([base, x, spillover(x, passage, position=position)])
     ok = np.isfinite(y) & np.isfinite(full).all(axis=1)
     y, base, full, passage = y[ok], base[ok], full[ok], passage[ok]
     if y.size < 20:
@@ -153,6 +162,7 @@ def sweep_reference(
     n_folds: int | None = None,
     use_mixed: bool = True,
     seed: int = 0,
+    position: np.ndarray | None = None,
 ) -> dict:
     """The whole delta-log-likelihood curve for one reference, plus its argmax."""
     curve = []
@@ -160,7 +170,8 @@ def sweep_reference(
         s = window_surprisal(corpus, int(k), P_override)
         curve.append({"k": int(k),
                       "delta_ll": heldout_delta_ll(gaze, controls, s, passage,
-                                                   n_folds, use_mixed, seed)})
+                                                   n_folds, use_mixed, seed,
+                                                   position=position)})
     fin = [c for c in curve if np.isfinite(c["delta_ll"])]
     best = max(fin, key=lambda c: c["delta_ll"])["k"] if fin else None
     return {"reference": name, "curve": curve, "argmax_k": best,
@@ -178,6 +189,7 @@ def argmax_picks(
     n_folds: int = 5,
     use_mixed: bool = False,
     seed: int = 0,
+    position: np.ndarray | None = None,
 ) -> list[dict]:
     """The selected window on each passage resample ``b`` in ``reps``.
 
@@ -186,6 +198,7 @@ def argmax_picks(
     A replicate on which no grid point gives a finite gain records ``None``.
     """
     passage = np.asarray(passage)
+    position = None if position is None else np.asarray(position)
     uniq = np.unique(passage)
     surp = {int(k): window_surprisal(corpus, int(k), P_override) for k in k_grid}
     rows = []
@@ -197,7 +210,8 @@ def argmax_picks(
         for k in k_grid:
             v = heldout_delta_ll(gaze[idx], np.asarray(controls)[idx],
                                  surp[int(k)][idx], passage[idx], n_folds,
-                                 use_mixed, seed)
+                                 use_mixed, seed,
+                                 position=None if position is None else position[idx])
             if np.isfinite(v) and v > best_v:
                 best_k, best_v = int(k), v
         rows.append({"replicate": int(b), "best_k": best_k})
@@ -235,6 +249,7 @@ def argmax_bootstrap(
     n_folds: int = 5,
     use_mixed: bool = False,
     seed: int = 0,
+    position: np.ndarray | None = None,
 ) -> dict:
     """Cluster bootstrap of the selected window.
 
@@ -243,7 +258,8 @@ def argmax_bootstrap(
     with an interval drawn around it.
     """
     return summarise_argmax(argmax_picks(corpus, gaze, controls, passage, P_override,
-                                         k_grid, range(n_boot), n_folds, use_mixed, seed))
+                                         k_grid, range(n_boot), n_folds, use_mixed, seed,
+                                         position=position))
 
 
 def rt_gain_table(
@@ -256,6 +272,7 @@ def rt_gain_table(
     n_folds: int = 5,
     use_mixed: bool = True,
     seed: int = 0,
+    position: np.ndarray | None = None,
 ) -> list[dict]:
     """Held-out gain of each fitted kernel's surprisal over full-context surprisal.
 
@@ -271,7 +288,8 @@ def rt_gain_table(
     for name, (theta, model) in fitted.items():
         lossy = surprisal_from_corpus(corpus, theta, model, kernel)
         r: RTResult = reading_time_gain(gaze, full, lossy, controls, passage,
-                                        n_folds=n_folds, use_mixed=use_mixed, seed=seed)
+                                        n_folds=n_folds, use_mixed=use_mixed, seed=seed,
+                                        position=position)
         rows.append({
             "reader": name,
             "estimator": model.name,
@@ -282,6 +300,7 @@ def rt_gain_table(
             "n_words": r.n_words,
             "estimator_backend": r.estimator,
             "converged": r.converged,
+            "note": r.note,
         })
     human = next((r["gain_per_word"] for r in rows if r["reader"] == "human"), None)
     for r in rows:
@@ -309,6 +328,7 @@ def run_sweep(
     use_mixed: bool = True,
     kernel=POWER,
     seed: int = 0,
+    position: np.ndarray | None = None,
 ) -> dict:
     """Stage one of E4: every deterministic table, saved so the shards can skip it.
 
@@ -320,16 +340,24 @@ def run_sweep(
     sweeps, flat = {}, []
     for name, override in refs.items():
         sw = sweep_reference(corpus, gaze, controls, passage, name, override, k_grid,
-                             n_folds, use_mixed, seed)
+                             n_folds, use_mixed, seed, position=position)
         sweeps[name] = sw
         for c in sw["curve"]:
             flat.append({"reference": name, **c})
     art.table("e4_sweep_curves", flat)
     stage = {"references": list(refs), "sweeps": sweeps,
+             "n_targets": int(len(gaze)),
+             "n_targets_with_gaze": int(np.isfinite(np.asarray(gaze, dtype=float)).sum()),
+             # Rows whose spillover lag has no built target (the word after a
+             # passage's first word, or after any word below min_responses) drop
+             # out of every fit above, and this is the count that survives.
+             "n_targets_usable": int((np.isfinite(np.asarray(gaze, dtype=float))
+                                      & np.isfinite(spillover(np.ones(len(gaze)), passage,
+                                                              position=position))).sum()),
              "model_free": context_slopes(corpus)}
     if fitted:
         rows = rt_gain_table(corpus, gaze, controls, passage, fitted, kernel=kernel,
-                             n_folds=5, use_mixed=use_mixed, seed=seed)
+                             n_folds=5, use_mixed=use_mixed, seed=seed, position=position)
         art.table("e4_rt_gain", rows)
         stage["rt_gain"] = rows
     hw = hard_window_sweep(corpus, models[0], windows=tuple(k_grid), n_folds=5, seed=seed)
@@ -357,13 +385,14 @@ def run_argmax_shard(
     references: dict | None = None,
     k_grid=K_GRID,
     seed: int = 0,
+    position: np.ndarray | None = None,
 ) -> list[dict]:
     """Stage two of E4: argmax replicates ``reps`` for every reference."""
     refs = {"primary": None} if not references else references
     rows = []
     for name, override in refs.items():
         for r in argmax_picks(corpus, gaze, controls, passage, override, k_grid, reps,
-                              seed=seed):
+                              seed=seed, position=position):
             rows.append({"reference": name, **r})
     write_shard(out_dir, "e4_argmax", reps, rows)
     return rows
@@ -412,18 +441,22 @@ def run(
     use_mixed: bool = True,
     kernel=POWER,
     seed: int = 0,
+    position: np.ndarray | None = None,
 ) -> dict:
     """Full E4 leg: the sweep across references, the argmax bootstrap, the gains."""
     stage = run_sweep(corpus, gaze, controls, passage, models, out_dir, references,
-                      fitted, k_grid, n_folds, use_mixed, kernel, seed)
+                      fitted, k_grid, n_folds, use_mixed, kernel, seed, position=position)
     rows = run_argmax_shard(corpus, gaze, controls, passage, out_dir, range(n_boot),
-                            references, k_grid, seed)
+                            references, k_grid, seed, position=position)
     return assemble(stage, rows, out_dir)
 
 
 def _prediction_8(sweeps: dict) -> dict:
     """Does the sweep disagree across zero-decay references, or bottom out at zero?"""
-    ks = [s["argmax_k"] for s in sweeps.values() if s["argmax_k"] is not None]
+    # A reference whose sweep never selected a window is null in the stage file
+    # and nan once the merge has read it back; either way it is not a k.
+    ks = [int(s["argmax_k"]) for s in sweeps.values()
+          if s["argmax_k"] is not None and np.isfinite(s["argmax_k"])]
     pos = [k for k in ks if k > 0]
     ratio = (max(pos) / min(pos)) if len(pos) >= 2 else float("nan")
     return {

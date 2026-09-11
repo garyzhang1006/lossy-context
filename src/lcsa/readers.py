@@ -66,9 +66,9 @@ __all__ = [
 LADDER_DHALF = (2.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 32.0, 64.0, 128.0, float("inf"))
 
 
-def ladder_deltas() -> list[float]:
-    """``delta = ln 2 / ln(1 + d_half)`` at each rung."""
-    return [delta_from_d_half(d) for d in LADDER_DHALF]
+def ladder_deltas(kernel=POWER) -> list[float]:
+    """The ``delta`` that puts retention at one half at each rung, under ``kernel``."""
+    return [delta_from_d_half(d, kernel) for d in LADDER_DHALF]
 
 
 def draw_counts(
@@ -165,8 +165,9 @@ def calibrate_n0_prime(
     """Bisection on the tilt scale so the floor reproduces a target design effect.
 
     The design effect is averaged over a few draws, since a single draw with 55
-    clusters is noisy; the returned record carries the achieved value so that a
-    calibration that failed to reach the target is visible rather than implied.
+    clusters is noisy; the returned record carries the achieved value, and
+    ``converged`` says whether the tolerance was met, so that a calibration that
+    failed to reach the target is visible rather than implied.
     """
     from lcsa.inference import score_test
 
@@ -188,25 +189,37 @@ def calibrate_n0_prime(
             "reporting the boundary", hi, top, target_design_effect
         )
         return {"sigma": hi, "design_effect": top, "target": target_design_effect,
-                "baseline": base, "at_bound": True}
+                "baseline": base, "at_bound": True, "converged": False}
     a, b = lo, hi
-    best = hi
+    # Only an evaluated, finite design effect can stand as the answer: a draw
+    # that failed says nothing about its tilt scale, and carrying that scale
+    # forward would report a calibration nobody measured.  ``hi`` qualifies
+    # because the guard above has already checked it.
+    best, best_v = hi, top
     for i in range(n_iter):
         mid = 0.5 * (a + b)
         v = deff(mid)
-        best = mid
         if not np.isfinite(v):
+            log.warning("tilt scale %.4f produced no finite design effect; "
+                        "shrinking the bracket", mid)
             b = mid
             continue
+        if abs(v - target_design_effect) < abs(best_v - target_design_effect):
+            best, best_v = mid, v
         if abs(v - target_design_effect) <= tol * max(target_design_effect, 1.0):
             return {"sigma": mid, "design_effect": v, "target": target_design_effect,
-                    "baseline": base, "at_bound": False}
+                    "baseline": base, "at_bound": False, "converged": True}
         if v < target_design_effect:
             a = mid
         else:
             b = mid
-    return {"sigma": best, "design_effect": deff(best), "target": target_design_effect,
-            "baseline": base, "at_bound": False}
+    log.warning(
+        "tilt scale search stopped after %d steps at design effect %.2f against a "
+        "target of %.2f; reporting the closest scale it measured", n_iter, best_v,
+        target_design_effect
+    )
+    return {"sigma": best, "design_effect": best_v, "target": target_design_effect,
+            "baseline": base, "at_bound": False, "converged": False}
 
 
 def tilt_directions(
@@ -372,7 +385,9 @@ def reader_ladder(
     its retention lottery.
     """
     rng = np.random.default_rng(seed)
-    delta = delta_from_d_half(d_half)
+    # A rung is a half-distance, so the delta realising it depends on the kernel
+    # the mask is drawn under and not on ``d_half`` alone.
+    delta = delta_from_d_half(d_half, kernel)
     M = gen_corpus.M
     out = []
     for tgt in gen_corpus:

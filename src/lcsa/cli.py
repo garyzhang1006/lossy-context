@@ -82,7 +82,7 @@ def cmd_build(args) -> int:
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    provo = load_provo(args.provo_dir, require_eye=not args.no_eye)
+    provo = load_provo(args.provo_dir, norms_name=args.norms_name, require_eye=not args.no_eye)
     log.info("provo: %s", provo.summary())
     raw, enc = read_provo_csv(Path(args.provo_dir) / args.norms_name)
     g0 = g0_data_integrity(raw, provo)
@@ -165,7 +165,22 @@ def cmd_build(args) -> int:
     log.info("G1 %s: %.2f TFLOP/s over %d tokens", "passed" if g1.passed else "FAILED",
              tflops, tokens)
     g2 = gate_g0(corpus, provo)
-    (out / "g0_cache.json").write_text(json.dumps(g2, indent=2, default=str))
+    log.info("G0 cache %s: %s", "passed" if g2["passed"] else "FAILED", g2)
+    accepted = g2["passed"] or args.force
+    # The sbatch scripts take g0_cache.json as the mark of a finished build and
+    # skip the GPU pass when it exists, so a rejected cache writes its record
+    # under another name: the cache stays on disk for inspection, the job fails
+    # so that the afterok chain does not fit forty legs to an ablation that did
+    # nothing, and a resubmission rebuilds instead of accepting the failure.
+    record = "g0_cache.json" if accepted else "g0_cache_failed.json"
+    (out / record).write_text(json.dumps(g2, indent=2, default=str))
+    if not accepted:
+        raise SystemExit(
+            f"G0 failed on the finished cache ({g2['degenerate_targets']} of "
+            f"{g2['n_checked']} sampled targets have identical depth-0 and depth-K rows, "
+            f"{g2['rows_not_normalised']} rows not normalised; see {out / record}); "
+            f"{out / 'cache.npz'} is kept for inspection and nothing downstream should "
+            "read it. Pass --force to accept it anyway.")
     print(json.dumps({"targets": len(corpus), "clusters": corpus.n_clusters,
                       "mean_K": corpus.mean_K, "seconds": dt, "tflops": tflops,
                       "g1_passed": g1.passed, "cache": str(out / "cache.npz")},
@@ -406,27 +421,37 @@ def cmd_e4(args) -> int:
             "targets; they must come from the same build"
         )
     unigrams = load_subtlex(args.subtlex)
-    y, ctrl, passage = e4.gaze_table(provo, keys, unigrams)
+    y, ctrl, passage, position = e4.gaze_table(provo, keys, unigrams)
     refs = _e4_references(args, corpus, keys)
     kernel = _kernel(args)
     if args.stage in ("all", "sweep"):
         f = fit(corpus, models[0], kernel, n_starts=3, seed=args.seed)
         fitted = {"human": (f.theta, models[0])}
+        if args.tilted_from:
+            # Prediction 7 compares a null's spuriously fitted kernel with the
+            # human kernel on held-out reading times, so each substantive null
+            # is drawn and fitted here exactly as E3's paired contrast draws it.
+            from lcsa.experiments.e3_nulls import load_prepared, null_corpora_from
+
+            prep = load_prepared(args.tilted_from, corpus)
+            for nm, null_corpus in null_corpora_from(corpus, prep, args.seed).items():
+                fn = fit(null_corpus, models[0], kernel, n_starts=3, seed=args.seed)
+                fitted[nm] = (fn.theta, models[0])
     if args.stage == "all":
         res = e4.run(corpus, y, ctrl, passage, models, args.out, references=refs,
                      fitted=fitted, n_boot=args.n_boot, n_folds=args.n_folds,
-                     kernel=kernel, seed=args.seed)
+                     kernel=kernel, seed=args.seed, position=position)
         _print({"selected_k": res["selected"], "prediction_8": res["prediction_8"]})
     elif args.stage == "sweep":
         stage = e4.run_sweep(corpus, y, ctrl, passage, models, args.out, references=refs,
                              fitted=fitted, n_folds=args.n_folds, kernel=kernel,
-                             seed=args.seed)
+                             seed=args.seed, position=position)
         _print({"stage": "sweep", "selected_k": {n: s["argmax_k"]
                                                  for n, s in stage["sweeps"].items()}})
     else:
         reps = _rep_range(args, args.n_boot, "boot_start", "boot_stop")
         rows = e4.run_argmax_shard(corpus, y, ctrl, passage, args.out, reps,
-                                   references=refs, seed=args.seed)
+                                   references=refs, seed=args.seed, position=position)
         _print({"stage": "boot", "replicates": [reps.start, reps.stop], "rows": len(rows)})
     return 0
 
@@ -663,7 +688,7 @@ def cmd_merge(args) -> int:
         elif leg == "e5":
             from lcsa.experiments.e5_participants import merge
 
-            out["e5"] = merge(args.out)["summary"]
+            out["e5"] = merge(args.out, n_part=args.n_participants)["summary"]
         elif leg == "e6":
             from lcsa.experiments.e6_crossed import merge
 
@@ -942,6 +967,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="comma list from e2,e3,e4,e5,e6")
     mg.add_argument("--estimators", nargs="+", default=["naive", "repaired"])
     mg.add_argument("--margin", type=float, default=0.25, help="TOST margin for E3")
+    mg.add_argument("--n-participants", type=int, default=None,
+                    help="participant count the E5 shards must tile (N_PART on the cluster)")
     mg.set_defaults(func=cmd_merge)
 
     st = sub.add_parser("selftest", help="synthetic end-to-end run, no data, no GPU")

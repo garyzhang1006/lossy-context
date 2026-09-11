@@ -203,8 +203,8 @@ def load_provo(
         {
             "text_id": pd.to_numeric(norms[cols["text_id"]], errors="coerce"),
             "word_number": pd.to_numeric(norms[cols["word_number"]], errors="coerce"),
-            "word": norms[cols["word"]].astype(str),
-            "response": norms[cols["response"]].astype(str),
+            "word": norms[cols["word"]].fillna("").astype(str),
+            "response": norms[cols["response"]].fillna("").astype(str),
             "count": pd.to_numeric(norms[cols["response_count"]], errors="coerce"),
         }
     )
@@ -214,13 +214,25 @@ def load_provo(
             == "content"
         ).astype(float)
     else:
+        log.warning("%s has no Word_Content_Or_Function column; the is_content "
+                    "feature is missing for every target", norms_name)
         n["is_content"] = np.nan
     n = n.dropna(subset=["text_id", "word_number", "count"])
     n["text_id"] = n["text_id"].astype(int)
     n["word_number"] = n["word_number"].astype(int)
     n = n[n["response"].str.strip() != ""]
+    # A blank Word cell would otherwise enter the passage as the string "nan",
+    # be scored as context by the reference model and pass G0's join check,
+    # since both sides of that comparison read the same cell.
+    blank_word = n["word"].str.strip() == ""
+    if blank_word.any():
+        log.warning("%d norms rows have a blank Word and are dropped", int(blank_word.sum()))
+        n = n[~blank_word]
     if n.empty:
         raise ValueError("the predictability norms file produced no usable responses")
+    if (n["word_number"] < 0).any():
+        raise ValueError("the predictability norms file has a negative Word_Number, which "
+                         "Python list indexing would silently write over another word")
 
     # Passage word lists: one row per (text_id, word_number).
     w = (
@@ -282,23 +294,33 @@ def load_provo(
         # The two arms are joined on (text_id, word_number) alone, and nothing
         # downstream would notice if the eye-tracking file numbered a passage
         # differently: E4 would regress gaze on the surprisal of a neighbouring
-        # word.  Where the file names the word, a key whose word disagrees with
-        # the norms is dropped from the gaze arm and counted for G0.
-        # The comparison folds accents and punctuation away because the two
-        # files need not decode under the same encoding, and a key whose word
-        # the eye-tracking file leaves blank cannot be checked either way.
+        # word.  Where the file names the word, the first key in a passage
+        # whose word disagrees with the norms starts a quarantine that runs to
+        # the end of that passage's gaze arm, because a shift in the numbering
+        # cannot heal itself and a key where the shifted word happens to
+        # coincide ("had had", a repeated "the") would otherwise survive with a
+        # neighbour's reading time attached.  The comparison folds accents and
+        # punctuation away because the two files need not decode under the
+        # same encoding, and a key either file cannot name is not evidence.
         if "word" in gaze.columns:
             norm_word = {(int(t), int(k)): _compare_key(x)
                          for t, k, x in zip(w["text_id"], w["word_number"], w["word"])}
             eye_word = (gaze.groupby(["text_id", "word_number"])["word"]
                         .agg(lambda s: next((_compare_key(x) for x in s if _compare_key(x)), "")))
-            bad = {k for k, x in eye_word.items() if x and k in norm_word and norm_word[k] != x}
+            first_bad: dict[int, int] = {}
+            for (t, k), x in eye_word.items():
+                if x and norm_word.get((t, k)) and norm_word[(t, k)] != x:
+                    first_bad[t] = min(first_bad.get(t, k), k)
+            bad = {(t, k) for (t, k) in eye_word.index
+                   if t in first_bad and k >= first_bad[t] and (t, k) in norm_word}
             arm_mism = len(bad)
             if bad:
                 log.warning(
-                    "%d (text_id, word_number) keys carry a different word in the "
-                    "eye-tracking file than in the norms and are dropped from the "
-                    "gaze arm, e.g. %s", arm_mism, sorted(bad)[:5],
+                    "%d passages carry a different word in the eye-tracking file "
+                    "than in the norms from some word on (first disagreement at %s); "
+                    "%d (text_id, word_number) keys are dropped from the gaze arm "
+                    "from that word to the end of the passage",
+                    len(first_bad), sorted(first_bad.items())[:5], arm_mism,
                 )
                 keys = list(zip(gaze["text_id"], gaze["word_number"]))
                 gaze = gaze[[k not in bad for k in keys]]
@@ -312,8 +334,10 @@ def load_provo(
         inter = key_w & key_g
         if not inter:
             raise ValueError(
-                "the cloze and eye-tracking arms share no (text_id, word_number) key; "
-                "check that both files come from the same Provo release"
+                "the cloze and eye-tracking arms share no (text_id, word_number) key"
+                + (f" after {arm_mism} keys were dropped for naming a different word "
+                   "in each file; the eye-tracking file numbers its passages differently"
+                   if arm_mism else "; check that both files come from the same Provo release")
             )
     else:
         inter = set()

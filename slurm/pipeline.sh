@@ -2,7 +2,7 @@
 # Submit the whole chain with afterok dependencies, from the repository root.
 #
 #   bash slurm/pipeline.sh
-#   N_REP=20 N_BOOT=20 E2_SHARDS=2 E3_SHARDS=2 E3_BOOT_SHARDS=2 E4_SHARDS=2 bash slurm/pipeline.sh
+#   N_REP=20 N_BOOT=20 E2_SHARDS=2 E3_SHARDS=2 E3_BOOT_SHARDS=2 E4_SHARDS=2 E6_SHARDS=2 E5_SHARDS=2 bash slurm/pipeline.sh
 #   LCSA_KERNEL=linear bash slurm/pipeline.sh robustness   # after the registered run
 #   LCSA_PARTICIPANTS=/path/to/cloze_by_participant.csv bash slurm/pipeline.sh   # adds E5
 #
@@ -17,6 +17,10 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 LCSA_VARS_ONLY=1 . slurm/env.sh
 [ -f "$LCSA_VENV/bin/activate" ] || { echo "no venv at $LCSA_VENV; sbatch slurm/setup.sbatch and wait for it first" >&2; exit 2; }
 read -ra READERS <<< "$E3_READERS"
+read -ra BREFS <<< "$LCSA_REFS"
+read -ra SWEEPREFS <<< "$LCSA_SWEEP_REFS"
+HAVE_PART=0
+if [ -n "${LCSA_PARTICIPANTS:-}" ] && [ -f "$LCSA_PARTICIPANTS" ]; then HAVE_PART=1; fi
 
 # env.sh created $LCSA_ROOT/logs above; Slurm fails a job outright when its
 # --output directory is absent.  When LCSA_ROOT has been moved off the default
@@ -45,7 +49,8 @@ EOF
 # the excess rather than refusing it, so this is a note about wall clock and
 # not an error; it is printed here because an array that sits in PENDING with
 # reason QOSMaxJobsPerUserLimit otherwise looks like a stuck chain.
-TASKS=$(( E2_SHARDS + ${#READERS[@]} * E3_SHARDS + E3_BOOT_SHARDS + 1 + E4_SHARDS + E6_SHARDS ))
+TASKS=$(( E2_SHARDS + ${#READERS[@]} * E3_SHARDS + E3_BOOT_SHARDS + 1 + E4_SHARDS + E6_SHARDS
+          + ${#BREFS[@]} + ${#SWEEPREFS[@]} + HAVE_PART * (E5_SHARDS + 1) ))
 [ "$TASKS" -le "$LCSA_MAX_RUNNING" ] || echo \
     "note: this chain submits $TASKS array tasks and QOS normal runs $LCSA_MAX_RUNNING at a time, so the rest wait with reason QOSMaxJobsPerUserLimit"
 
@@ -68,11 +73,10 @@ fi
 # result, so they run at the head of every submission.
 PRE=$(jid slurm/prefetch.sbatch);                                    echo "prefetch   $PRE"
 REGLEGS=e1,e2,e3,e4,e6
-if [ -n "${LCSA_PARTICIPANTS:-}" ] && [ -f "$LCSA_PARTICIPANTS" ]; then REGLEGS=$REGLEGS,e5; fi
+[ "$HAVE_PART" -eq 0 ] || REGLEGS=$REGLEGS,e5
 REG=$(REGISTER_LEGS=$REGLEGS jid slurm/register.sbatch);              echo "register   $REG  (legs $REGLEGS)"
 BUILD=$(jid --dependency=afterok:$PRE:$REG --gres="$LCSA_GPU_GRES" slurm/build.sbatch)
 echo "build      $BUILD  ($LCSA_GPU_GRES)"
-read -ra BREFS <<< "$LCSA_REFS"
 REFS=$(jid --dependency=afterok:$BUILD --gres="$LCSA_GPU_GRES" --array=0-$(( ${#BREFS[@]} - 1 )) slurm/build_refs.sbatch)
 echo "refs       $REFS  (${#BREFS[@]} checkpoints)"
 E1=$(jid --dependency=afterok:$BUILD slurm/e1.sbatch);                echo "e1         $E1"
@@ -93,7 +97,6 @@ BOOT=$(jid --dependency=afterok:$REFS:$PREP --array=0-$((E4_SHARDS - 1)) slurm/e
 echo "e4 boot    $BOOT"
 PANEL=$(jid --dependency=afterok:$PREP:$LAD --array=0-$((E6_SHARDS - 1)) slurm/e6_crossed.sbatch)
 echo "e6 panel   $PANEL"
-read -ra SWEEPREFS <<< "$LCSA_SWEEP_REFS"
 SWEEP=$(jid --dependency=afterok:$BUILD --gres="$LCSA_SWEEP_GPU_GRES" --array=0-$(( ${#SWEEPREFS[@]} - 1 )) slurm/refsweep.sbatch)
 echo "refsweep   $SWEEP"
 LEGS=e2,e3,e4,e6
@@ -103,8 +106,14 @@ LEGS=e2,e3,e4,e6
 DEPS=$E1:$REL:$COV:$REPS:$HUM:$SELF:$CONF:$SW:$BOOT:$PANEL
 # E5 needs the per-participant cloze export, which the distributed norms do not
 # carry; without it the leg is skipped here instead of failing the chain.
-if [ -n "${LCSA_PARTICIPANTS:-}" ] && [ -f "$LCSA_PARTICIPANTS" ]; then
-    PART=$(jid --dependency=afterok:$PREP --array=0-$E5_SHARDS slurm/e5_participants.sbatch)
+if [ "$HAVE_PART" -eq 1 ]; then
+    # Task 0 writes the pooled fit that every participant shard pins its
+    # nuisances to, so it is submitted alone and the shards wait on it; as
+    # one array the shards would start beside it and die on the missing
+    # e5_theta_pooled.json, and afterok would then cancel the merge.
+    POOL=$(jid --dependency=afterok:$PREP --array=0 slurm/e5_participants.sbatch)
+    echo "e5 pooled  $POOL"
+    PART=$(jid --dependency=afterok:$POOL --array=1-$E5_SHARDS slurm/e5_participants.sbatch)
     echo "e5 partic  $PART"
     LEGS=$LEGS,e5; DEPS=$DEPS:$PART
 else

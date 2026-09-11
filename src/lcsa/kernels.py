@@ -74,7 +74,10 @@ def _linear_r(d: np.ndarray, delta: float) -> np.ndarray:
 
 def _linear_dr(d: np.ndarray, delta: float) -> np.ndarray:
     d = np.asarray(d, dtype=np.float64)
-    active = (1.0 - float(delta) * d > 0.0) & (1.0 - float(delta) * d < 1.0)
+    # Active wherever the unclipped weight is still positive, ``delta = 0``
+    # included: gating on ``1 - delta d < 1`` as well would kill the derivative
+    # at exactly the point a fit starts from, leaving it with no gradient.
+    active = 1.0 - float(delta) * d > 0.0
     return np.where(active, -d, 0.0)
 
 
@@ -202,21 +205,32 @@ def marginalise_and_grad(
     return P[0] + r @ D, dr @ D
 
 
-def d_half_from_delta(delta: float) -> float:
-    """``d_half = 2^(1/delta) - 1`` for the power kernel; ``inf`` at ``delta = 0``."""
+def d_half_from_delta(delta: float, kernel: str | Kernel = POWER) -> float:
+    """Distance at which ``r`` has fallen to one half; ``inf`` at ``delta = 0``.
+
+    Kernel-aware because the half-distance is defined by ``r(d_half) = 1/2``,
+    which the power and linear kernels solve differently; passing a delta fitted
+    under one kernel through the other's formula reports the wrong rung.
+    """
     delta = float(delta)
     if delta <= 0:
         return float("inf")
+    name = get_kernel(kernel).name
+    if name == "linear":
+        return 0.5 / delta
     with np.errstate(over="ignore"):
         val = np.exp2(1.0 / delta) - 1.0
     return float(val)
 
 
-def delta_from_d_half(d_half: float) -> float:
-    """``delta = ln 2 / ln(1 + d_half)``; ``0`` at ``d_half = inf``."""
+def delta_from_d_half(d_half: float, kernel: str | Kernel = POWER) -> float:
+    """Inverse of :func:`d_half_from_delta`; ``0`` at ``d_half = inf``."""
     d_half = float(d_half)
     if not np.isfinite(d_half):
         return 0.0
     if d_half <= 0:
         raise ValueError(f"d_half must be positive or inf, got {d_half}")
+    name = get_kernel(kernel).name
+    if name == "linear":
+        return 0.5 / d_half
     return float(np.log(2.0) / np.log1p(d_half))

@@ -149,3 +149,26 @@ def test_the_first_job_logs_somewhere_that_already_exists():
         other = [ln for ln in (SLURM / f"{name}.sbatch").read_text().splitlines()
                  if ln.startswith("#SBATCH --output=")]
         assert other and "/logs/" in other[0], name
+
+
+def test_the_pooled_e5_fit_is_its_own_job_ahead_of_the_participant_shards():
+    """The fits read ``e5_theta_pooled.json``, which task 0 writes; as one array
+    the shards start beside task 0, exit on the missing file, and ``afterok``
+    then cancels the merge."""
+    lines = [ln.strip() for ln in (SLURM / "pipeline.sh").read_text().splitlines()]
+    pool = next(ln for ln in lines if ln.startswith("POOL="))
+    part = next(ln for ln in lines if ln.startswith("PART="))
+    assert "--array=0 " in pool and "e5_participants.sbatch" in pool, pool
+    assert "afterok:$POOL" in part and "--array=1-$E5_SHARDS" in part, part
+
+
+def test_preflight_and_pipeline_count_the_same_array_tasks():
+    """The two formulas drift apart otherwise, and the QOS warning then names
+    a number the submitted chain does not have."""
+    def formula(name):
+        text = (SLURM / name).read_text()
+        body = text.split("TASKS=$((", 1)[1].split("))", 1)[0]
+        return "".join(body.split())
+    pipe = formula("pipeline.sh").replace("${#READERS[@]}", "NREADERS") \
+        .replace("${#BREFS[@]}", "NREFS").replace("${#SWEEPREFS[@]}", "NSWEEP")
+    assert pipe == formula("preflight.sh")

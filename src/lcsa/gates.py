@@ -54,6 +54,9 @@ def g0_data_integrity(raw_norms, provo, corpus=None) -> GateResult:
     string as well and the number of keys it dropped is reported here as
     ``arm_word_mismatches`` (``None`` when that file names no word), since a
     shifted join there would regress gaze on a neighbouring word's surprisal.
+    Those keys are gone from the gaze arm, so the join that remains is right;
+    the gate fails when more than a tenth of the targets went, because a
+    reading-time leg fitted on the remainder is no longer the registered one.
     """
     import pandas as pd
 
@@ -68,7 +71,7 @@ def g0_data_integrity(raw_norms, provo, corpus=None) -> GateResult:
         if resp_col else -1
     )
     empty_resp = (
-        int((raw_norms[resp_col].astype(str).str.strip() == "").sum())
+        int((raw_norms[resp_col].fillna("").astype(str).str.strip() == "").sum())
         if resp_col else -1
     )
 
@@ -88,12 +91,17 @@ def g0_data_integrity(raw_norms, provo, corpus=None) -> GateResult:
         if len(provo.responses) else np.array([])
     )
 
+    arm_mism = getattr(provo, "arm_word_mismatches", None)
+    arm_frac = (
+        float(arm_mism / counts.size) if arm_mism is not None and counts.size else 0.0
+    )
     measured = {
         "replacement_chars": fffd,
         "literal_NA_responses": literal_na,
         "empty_responses": empty_resp,
         "join_mismatches": mism,
-        "arm_word_mismatches": getattr(provo, "arm_word_mismatches", None),
+        "arm_word_mismatches": arm_mism,
+        "arm_word_mismatch_frac": arm_frac,
         "frac_targets_ge_25_responses": frac25,
         "mean_responses": float(counts.mean()) if counts.size else float("nan"),
         "mean_response_types": float(types.mean()) if types.size else float("nan"),
@@ -105,10 +113,12 @@ def g0_data_integrity(raw_norms, provo, corpus=None) -> GateResult:
             if np.abs(P.sum(axis=1) - 1.0).max() > 1e-6:
                 rows_bad += 1
         measured["cache_rows_not_normalised"] = rows_bad
-    passed = fffd == 0 and mism == 0 and (frac25 > 0.95 or not np.isfinite(frac25))
+    passed = (fffd == 0 and mism == 0 and arm_frac <= 0.10
+              and (frac25 > 0.95 or not np.isfinite(frac25)))
     return GateResult(
         "G0", passed, measured,
-        "zero replacement characters, zero join mismatches, >95 percent of targets with 25+ responses",
+        "zero replacement characters, zero join mismatches, at most 10 percent of "
+        "targets dropped from the gaze arm, >95 percent of targets with 25+ responses",
         "without per-target type counts the multinomial likelihood is impossible; "
         "the project becomes the reading-time estimator alone with E4 as the paper",
     )

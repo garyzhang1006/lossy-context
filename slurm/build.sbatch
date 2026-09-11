@@ -35,9 +35,11 @@ for f in "$LCSA_PROVO/Provo_Corpus-Predictability_Norms.csv" "$LCSA_SUBTLEX"; do
     [ -f "$f" ] || { echo "missing $f; see slurm/prefetch.sbatch" >&2; exit 1; }
 done
 
-# Checked before the smoke run so that a requeued job costs no GPU time.
-if [ -f "$LCSA_ROOT/build/cache.npz" ]; then
-    echo "$LCSA_ROOT/build/cache.npz exists; remove it to rebuild"; exit 0
+# Checked before the smoke run so that a requeued job costs no GPU time.  The
+# gate record is the last file `lcsa build` writes, so a job that died after
+# cache.npz and before the gate is redone rather than taken as finished.
+if [ -f "$LCSA_ROOT/build/g0_cache.json" ]; then
+    echo "$LCSA_ROOT/build/g0_cache.json exists, so the build finished; remove $LCSA_ROOT/build to rebuild"; exit 0
 fi
 
 # Twenty targets first: every code path the full build uses, in minutes, and a
