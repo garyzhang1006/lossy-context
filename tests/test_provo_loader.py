@@ -44,16 +44,20 @@ def _norms_rows():
     return pd.DataFrame(rows)
 
 
-def _eye_rows(skip=(3, 7)):
+def _eye_rows(skip=(3, 7), shift=()):
+    """Eye-tracking rows; passages in ``shift`` carry the next word at each number."""
     rows = []
     for tid, words in PASSAGES.items():
         for i, w in enumerate(words, start=FIRST_WORD_NUMBER):
             if tid == 2 and i in skip:
                 continue  # the arms disagree, as they do in the real corpus
+            if tid in shift:
+                w = words[(i - FIRST_WORD_NUMBER + 1) % len(words)]
             for pid in range(4):
                 rows.append({
                     "Text_ID": tid,
                     "Word_Number": i,
+                    "Word": w,
                     "Participant_ID": f"p{pid}",
                     "IA_FIRST_RUN_DWELL_TIME": 200 + 10 * pid + 5 * i,
                     "IA_LENGTH": len(w),
@@ -131,6 +135,31 @@ def test_the_two_arms_are_reconciled_to_their_intersection(provo_dir):
     assert provo.summary()["eyetracked_words"] == 10
 
 
+def test_an_eye_arm_numbered_differently_is_dropped_not_joined(tmp_path):
+    """A shifted eye-tracking passage would regress gaze on the neighbouring word."""
+    _norms_rows().to_csv(tmp_path / "Provo_Corpus-Predictability_Norms.csv", index=False)
+    _eye_rows(shift=(2,)).to_csv(tmp_path / "Provo_Corpus-Eyetracking_Data.csv", index=False)
+    provo = load_provo(tmp_path, require_eye=True)
+    # Passage 2 has four eye-tracked numbers after the two skipped ones, and
+    # every one of them names the wrong word.
+    assert provo.arm_word_mismatches == 4
+    assert provo.intersection_size == len(PASSAGES[1])
+    assert set(provo.gaze["text_id"]) == {1}
+    assert "word" not in provo.gaze.columns
+    raw, _ = read_provo_csv(tmp_path / "Provo_Corpus-Predictability_Norms.csv")
+    assert g0_data_integrity(raw, provo).measured["arm_word_mismatches"] == 4
+
+
+def test_an_eye_file_without_a_word_column_cannot_be_checked(tmp_path):
+    _norms_rows().to_csv(tmp_path / "Provo_Corpus-Predictability_Norms.csv", index=False)
+    _eye_rows().drop(columns=["Word"]).to_csv(
+        tmp_path / "Provo_Corpus-Eyetracking_Data.csv", index=False)
+    provo = load_provo(tmp_path, require_eye=True)
+    assert provo.arm_word_mismatches is None
+    assert provo.intersection_size == 10
+    assert provo.summary()["arm_word_mismatches"] is None
+
+
 def test_missing_eye_file_is_only_fatal_when_required(tmp_path):
     _norms_rows().to_csv(tmp_path / "Provo_Corpus-Predictability_Norms.csv", index=False)
     assert load_provo(tmp_path).gaze is None
@@ -162,6 +191,7 @@ def test_gate_g0_passes_on_a_clean_join(provo_dir):
     g = g0_data_integrity(raw, provo)
     assert g.measured["replacement_chars"] == 0
     assert g.measured["join_mismatches"] == 0
+    assert g.measured["arm_word_mismatches"] == 0
     assert g.measured["literal_NA_responses"] == 12
     assert g.measured["frac_targets_ge_25_responses"] == 1.0
     assert g.passed

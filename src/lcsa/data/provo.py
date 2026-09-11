@@ -22,6 +22,8 @@ scale only.
 from __future__ import annotations
 
 import logging
+import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -63,6 +65,7 @@ _EYE_ALIASES = {
     "text_id": ["text_id", "textid"],
     "word_number": ["word_number", "wordnumber"],
     "participant_id": ["participant_id", "participantid", "subject_id"],
+    "word": ["word", "word_cleaned"],
     "gaze": [
         "ia_first_run_dwell_time",
         "ia_dwell_time",
@@ -78,6 +81,17 @@ def canonical_word(w: str) -> str:
     """Lowercase and strip surrounding punctuation, keeping internal apostrophes."""
     s = str(w).strip().lower()
     return s.strip(".,;:!?\"'()[]{}<>*")
+
+
+def _compare_key(w: str) -> str:
+    """The letters and digits of a word, accents folded, for cross-file comparison.
+
+    Punctuation is dropped entirely rather than stripped from the edges because
+    the two files can disagree on a curly apostrophe or a hyphen at the same
+    word, and the comparison is after a shifted number, not a spelling.
+    """
+    s = unicodedata.normalize("NFKD", canonical_word(w)).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]", "", s)
 
 
 def read_provo_csv(path: str | Path) -> tuple[pd.DataFrame, str]:
@@ -136,6 +150,9 @@ class ProvoData:
     gaze: pd.DataFrame | None  # text_id, word_number, participant_id, gaze
     intersection_size: int
     encoding: str
+    # Keys the eye-tracking file numbers differently from the norms, found by
+    # comparing its word column; None when that file carries no word column.
+    arm_word_mismatches: int | None = None
 
     @property
     def n_passages(self) -> int:
@@ -161,6 +178,7 @@ class ProvoData:
                 else 0
             ),
             "intersection": self.intersection_size,
+            "arm_word_mismatches": self.arm_word_mismatches,
             "encoding": self.encoding,
         }
 
@@ -237,6 +255,7 @@ def load_provo(
         passages[int(tid)] = row
 
     gaze = None
+    arm_mism = None
     eye_path = d / eye_name
     if eye_path.exists():
         eye, _ = read_provo_csv(eye_path)
@@ -254,10 +273,36 @@ def load_provo(
             if "participant_id" in ec
             else "unknown"
         )
+        if "word" in ec:
+            gaze["word"] = eye[ec["word"]].fillna("").astype(str)
         gaze = gaze.dropna(subset=["text_id", "word_number", "gaze"])
         gaze["text_id"] = gaze["text_id"].astype(int)
         gaze["word_number"] = gaze["word_number"].astype(int)
         gaze = gaze[gaze["gaze"] > 0]
+        # The two arms are joined on (text_id, word_number) alone, and nothing
+        # downstream would notice if the eye-tracking file numbered a passage
+        # differently: E4 would regress gaze on the surprisal of a neighbouring
+        # word.  Where the file names the word, a key whose word disagrees with
+        # the norms is dropped from the gaze arm and counted for G0.
+        # The comparison folds accents and punctuation away because the two
+        # files need not decode under the same encoding, and a key whose word
+        # the eye-tracking file leaves blank cannot be checked either way.
+        if "word" in gaze.columns:
+            norm_word = {(int(t), int(k)): _compare_key(x)
+                         for t, k, x in zip(w["text_id"], w["word_number"], w["word"])}
+            eye_word = (gaze.groupby(["text_id", "word_number"])["word"]
+                        .agg(lambda s: next((_compare_key(x) for x in s if _compare_key(x)), "")))
+            bad = {k for k, x in eye_word.items() if x and k in norm_word and norm_word[k] != x}
+            arm_mism = len(bad)
+            if bad:
+                log.warning(
+                    "%d (text_id, word_number) keys carry a different word in the "
+                    "eye-tracking file than in the norms and are dropped from the "
+                    "gaze arm, e.g. %s", arm_mism, sorted(bad)[:5],
+                )
+                keys = list(zip(gaze["text_id"], gaze["word_number"]))
+                gaze = gaze[[k not in bad for k in keys]]
+            gaze = gaze.drop(columns=["word"])
     elif require_eye:
         raise FileNotFoundError(f"{eye_path} not found and require_eye=True")
 
@@ -280,6 +325,7 @@ def load_provo(
         gaze=gaze,
         intersection_size=len(inter),
         encoding=enc,
+        arm_word_mismatches=arm_mism,
     )
 
 

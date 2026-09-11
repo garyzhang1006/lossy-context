@@ -48,10 +48,12 @@ def g0_data_integrity(raw_norms, provo, corpus=None) -> GateResult:
 
     Checks, in order: no U+FFFD replacement characters anywhere in the file, the
     literal response ``"NA"`` survived, empty responses are counted rather than
-    silently dropped, and the ``(Text_ID, Word_Number)`` join agrees on the word
-    string itself.  The naive join mismatches a few hundred of the 2,687 targets,
-    which is exactly the error that would propagate into every cached
-    distribution with nothing downstream to catch it.
+    silently dropped, and every norms row finds its own word at its
+    ``Word_Number`` in the passage list, which is the index every context
+    string is cut from.  The loader reconciles the eye-tracking arm on the word
+    string as well and the number of keys it dropped is reported here as
+    ``arm_word_mismatches`` (``None`` when that file names no word), since a
+    shifted join there would regress gaze on a neighbouring word's surprisal.
     """
     import pandas as pd
 
@@ -91,6 +93,7 @@ def g0_data_integrity(raw_norms, provo, corpus=None) -> GateResult:
         "literal_NA_responses": literal_na,
         "empty_responses": empty_resp,
         "join_mismatches": mism,
+        "arm_word_mismatches": getattr(provo, "arm_word_mismatches", None),
         "frac_targets_ge_25_responses": frac25,
         "mean_responses": float(counts.mean()) if counts.size else float("nan"),
         "mean_response_types": float(types.mean()) if types.size else float("nan"),

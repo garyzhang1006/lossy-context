@@ -26,6 +26,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from lcsa.cache import context_string
 from lcsa.corpusdata import Corpus
 from lcsa.data.provo import ProvoData, canonical_word
 from lcsa.data.subtlex import Unigrams
@@ -219,7 +220,7 @@ def build_corpus(
                 continue
             words = [str(w) for w in frozen]
         else:
-            full_ctx = " ".join(passage[:ti])
+            full_ctx = context_string(passage, ti, None)
             expansions = _expansion_words(scorer, full_ctx, cfg.top_k_expansions)
             words = candidate_set(
                 [str(x) for x in grp["response"].tolist()], str(r.word), expansions, cfg
@@ -242,7 +243,7 @@ def build_corpus(
                 f"target {key}: cache has shape {P.shape}, expected {(K + 1, len(words))}"
             )
 
-        prior = {canonical_word(x) for x in passage[:ti]}
+        prior = {canonical_word(x) for x in passage[:ti] if x}
         P_list.append(P)
         n_list.append(counts)
         u_list.append(unigrams.vector(words))
