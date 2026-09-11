@@ -57,15 +57,11 @@ this directory, because each script finds `slurm/env.sh` through
 somewhere else. If the clone already exists, `git pull` instead, since a stale
 checkout is how a fixed bug comes back.
 
-The repository is private, so an anonymous clone fails with `fatal: could not
-read Username for 'https://github.com'` and the API returns 404, which is what
-GitHub returns for a private repository and a nonexistent one alike. If that
-happens, the user has not granted this machine access yet: ask them for a
-read-only deploy key or a different URL, and do not go looking for a
-similar-looking public repository, because running the wrong code against a
-pre-registered design is worse than stopping. A deploy key needs
-`ssh.github.com` on port 443 in `~/.ssh/config`, since clusters block outbound
-port 22.
+The repository is public, so the clone needs no credentials. If it fails with
+`fatal: could not read Username for 'https://github.com'`, GitHub is asking for
+a login, which means the URL is wrong or the repository went private again; ask
+the user rather than looking for a similar-looking public repository, because
+running the wrong code against a pre-registered design is worse than stopping.
 
 Then run `bash slurm/preflight.sh`, and run it again after every step that
 could change its answer. It checks the partitions, the GPU type, the scratch paths, the
@@ -87,19 +83,33 @@ later. Then:
    `/athena/accardilab/scratch/$USER/lossy-context/data/`. Both sit behind
    browser downloads, on OSF and at UGent, so no script fetches them; ask the
    user for the files if they are not already there.
-3. The Hugging Face token. Seven of the eight checkpoints are ungated. The
-   eighth, `meta-llama/Llama-3.1-8B`, is gated and belongs to the appendix
-   sweep alone, so without a token the sweep skips it, the merge records it as
-   missing in `refsweep.csv`, and every registered result still lands. If the
-   user wants that row, they accept the licence on the model's Hub page and
-   run either `bash slurm/set_hf_token.sh` or `huggingface-cli login` on a
-   login node themselves. The first prompts with the input hidden and writes
-   `$HF_HOME/token` with mode 600, printing back only the length and the `hf_`
-   prefix. Never ask them to paste a token to you and never echo one, because
-   a token in a transcript is a leaked credential. `slurm/env.sh` reads
-   `HF_TOKEN`, then `$HF_HOME/token`, then `~/.cache/huggingface/token`, and
-   treats an empty value as absent. `bash slurm/preflight.sh` says whether a
-   token was found without revealing it.
+3. The Hugging Face token. The user has one and wants it used, so use it and
+   do not stall the run over it. `slurm/env.sh` reads `HF_TOKEN`, then
+   `$HF_HOME/token`, then `~/.cache/huggingface/token`, and treats an empty
+   value as absent, so a token already in place needs nothing from you, and
+   `bash slurm/preflight.sh` reports whether one was found without printing
+   it. To install one, run `bash slurm/set_hf_token.sh` on a login node: it
+   prompts with the input hidden, refuses anything without the `hf_` prefix,
+   writes `$HF_HOME/token` with mode 600, and prints back the length and the
+   prefix alone. It also reads a pipe, so
+   `printf '%s' "$TOKEN" | bash slurm/set_hf_token.sh` works when the user has
+   handed you the value.
+
+   Do not echo a token, do not write one into a file the user will paste
+   elsewhere, and do not print one in a summary. If the user gives you a token
+   directly, install it, say that you did, and tell them to rotate it at
+   https://huggingface.co/settings/tokens once the run is under way, because a
+   token that has passed through a chat is best replaced. Refusing it and
+   stopping is the wrong call, since rotating takes them under a minute and a
+   halted pipeline costs a day.
+
+   What the token buys is one row. Seven of the eight checkpoints are ungated,
+   and only `meta-llama/Llama-3.1-8B` in the appendix sweep is gated; it also
+   needs its licence accepted on the Hub by the same account, or the token
+   still gets a 403. Without a usable token the sweep skips that checkpoint,
+   the merge records it as missing in `refsweep.csv`, and every registered
+   result still lands, so a token problem never blocks the run. Say what
+   happened and keep going.
 4. `bash slurm/pipeline.sh` submits the whole chain with `afterok`
    dependencies and prints one line per job with its id. It starts with
    `prefetch.sbatch`, which downloads every checkpoint sequentially and writes
