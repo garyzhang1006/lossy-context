@@ -160,7 +160,10 @@ file with a different count instead of dropping the tail from the last shard.
    an empty `HF_TOKEN` makes `huggingface_hub` send an Authorization header
    with no token behind it. `huggingface-cli login` writes to the first of
    those two files when `HF_HOME` is set in the shell and to the second when
-   it is not, which is why both are tried. Without a token the sweep skips
+   it is not, which is why both are tried. `bash slurm/set_hf_token.sh` is the
+   shorter route: it prompts with the input hidden, refuses anything without
+   the `hf_` prefix, writes `$HF_HOME/token` with mode 600, needs no network
+   and no venv, and prints back the length and the prefix alone. Without a token the sweep skips
    that one checkpoint, names it as missing in `refsweep.csv`, and every
    registered leg still merges.
 4. `bash slurm/preflight.sh` checks the partitions, the gres string, the
