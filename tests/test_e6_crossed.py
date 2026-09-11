@@ -6,7 +6,7 @@ from lcsa.experiments import e3_nulls as e3
 from lcsa.experiments import e6_crossed as e6
 from lcsa.kernels import POWER
 from lcsa.likelihood import NAIVE, REPAIRED
-from tests.conftest import draw_true_delta, make_corpus
+from conftest import draw_true_delta, make_corpus
 
 
 def _prepared(tmp_path):

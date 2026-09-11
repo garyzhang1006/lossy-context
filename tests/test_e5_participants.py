@@ -5,7 +5,7 @@ import pytest
 from lcsa.experiments import e5_participants as e5
 from lcsa.kernels import POWER
 from lcsa.likelihood import NAIVE
-from tests.conftest import draw, make_corpus
+from conftest import draw, make_corpus
 
 
 def _participants(corpus, theta, n_people=6, seed=3):
