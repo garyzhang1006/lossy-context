@@ -5,7 +5,7 @@ registers an analysis (a split, a threshold, an interval formula) that the
 released code never implemented, and the plan file the text says was hashed is
 not in the repository.  The audit of the seed-noise release found exactly that.
 This module closes the gap by making the registration a file the pipeline
-consumes.  ``lcsa register`` writes the design constants, the eleven
+consumes.  ``lcsa register`` writes the design constants, the thirteen
 predictions with their thresholds, the reading rule and the pre-committed gate
 branches to ``registration.json`` before any result exists and records its
 SHA-256 in a sidecar.  ``lcsa merge`` refuses to run unless that file is present
@@ -69,6 +69,7 @@ def build_registration(n_rep: int = 200, n_boot: int = 200, seed: int = 0,
     from lcsa.experiments.e3_nulls import ALPHAS, FLOORS, N_RULE_FLOOR, N_SPLITS, RULE
     from lcsa.experiments.e6_crossed import PANEL_RUNGS, PANEL_TILT
     from lcsa.readers import LADDER_DHALF
+    from lcsa.subsetcache import BRIDGING_TARGETS, K_MAX
 
     readers = list(readers) if readers else ["N0", "N0-PRIME", "N-LEX", "N-TOPIC", "N-ORDER"]
     return {
@@ -85,18 +86,32 @@ def build_registration(n_rep: int = 200, n_boot: int = 200, seed: int = 0,
             "panel_rungs": _jsonable(PANEL_RUNGS), "panel_tilt": PANEL_TILT,
             "residual_alphas": _jsonable(ALPHAS), "residual_splits": N_SPLITS,
             "rule_floor_replicates": N_RULE_FLOOR,
+            "bridging_k_max": int(K_MAX),
+            "bridging_targets": int(BRIDGING_TARGETS),
             "shards": dict(shards or {}),
             "legs": list(legs),
             "replicate_seeding": "replicate b is seeded from (seed, b) alone, so shards tile",
         },
         "gates": {
+            "G0": {"branch": "without per-target type counts the multinomial likelihood is "
+                             "impossible; the project becomes the reading-time estimator alone "
+                             "with E4 as the paper"},
+            "G1": {"tflops_floor": 2.5,
+                   "branch": "re-price every GPU line, drop the competence readers, freeze the "
+                             "reference at Qwen2.5-0.5B before G3 and G4 run, and promote "
+                             "Qwen2.5-1.5B to the reference-dependence row of the E4 sweep"},
             "G2": {"tv_floor": 0.02, "frac_floor": 0.80,
                    "branch": "the smallest failing j is the analytic ceiling and prediction 9 reads it"},
+            "G3": {"human_js_ratio_floor": 1.5, "gaze_split_half_floor": 0.60,
+                   "branch": "contrasts carry an attenuation correction, and below 1.5 the human "
+                             "arm is dropped and the paper stands on the synthetic readers"},
             "G4": {"se_cap": 0.09, "rho_cap": 0.15,
                    "branch": "prediction 6 is scored as contrast-interval overlap, not TOST"},
             "G5": {"floor_reject_cap": 0.10,
-                   "branch": "predictions 2 to 11 and the reading rule are void"},
+                   "branch": "predictions 2 to 13 and the reading rule are void"},
             "G6": {"coverage_floor": 0.90, "rungs": [4.0, 8.0]},
+            "G7": {"gpu_hours_cap": 10.0, "gpu_hours_budget": 14.0,
+                   "branch": "defer the kernel-bridging enumeration, then drop the competence readers"},
         },
         "reading_rule": dict(RULE, estimator="naive", jeffreys_alpha=0.5),
         "predictions": [
@@ -130,11 +145,24 @@ def build_registration(n_rep: int = 200, n_boot: int = 200, seed: int = 0,
              "statement": "the identification ceiling, as a rate, lies in [12, 30] words",
              "support": {"window": [12.0, 30.0]}, "falsify": {"outside_window": True}},
             {"id": 10, "leg": "e1", "estimator": "naive",
-             "statement": "fitted delta under independent deletion and graded truncation agree within 0.25 log units on the short-context targets",
+             "statement": "fitted delta under independent deletion and graded truncation agree within 0.25 log units on the 439 short-context targets, the positions at K <= 8",
              "support": {"log_delta_tolerance": 0.25}, "falsify": {"beyond_tolerance": True}},
             {"id": 11, "leg": "e6", "estimator": "naive", "d_half": 8.0,
              "statement": "the N-ORDER tilt shifts the fitted half-life of the d_half=8 reader by at least one rung in at least 0.50 of replicates under the naive estimator",
              "support": {"share_at_least": 0.50}, "falsify": {"share_below": 0.20}},
+            {"id": 12, "leg": "e1", "estimator": "n/a",
+             "statement": "restoring a passage-initial span of the same length in place of the "
+                          "bare truncated prefix moves the candidate distribution by a median "
+                          "total-variation gap of at most 0.02, the same floor gate G2 uses to "
+                          "call a context moved, over the probed rows where the two spans differ",
+             "support": {"median_tv_gap_at_most": 0.02},
+             "falsify": {"median_tv_gap_above": 0.05}},
+            {"id": 13, "leg": "e3", "estimator": "naive",
+             "statement": "the human half-life fitted on an uncapped-depth cache, whose zero-decay "
+                          "member conditions on the full passage prefix, agrees with the capped "
+                          "value within 0.25 log units, which keeps both fits on one doubling rung",
+             "support": {"log_half_life_tolerance": 0.25},
+             "falsify": {"beyond_tolerance": True}},
         ],
     }
 
@@ -188,8 +216,12 @@ def check_constants(reg: dict) -> list[str]:
         shards=reg["design"]["shards"], frozen_at=reg["frozen_at"])
     out = []
     for key in ("ladder_d_half", "coverage_rungs", "ceiling_share", "panel_rungs", "panel_tilt",
-                "residual_alphas", "residual_splits", "rule_floor_replicates", "floors"):
-        if fresh["design"][key] != reg["design"][key]:
+                "residual_alphas", "residual_splits", "rule_floor_replicates", "floors",
+                "bridging_k_max", "bridging_targets"):
+        if key not in reg["design"]:
+            out.append(f"design.{key}: the registration predates this constant, so it froze "
+                       f"nothing while the code has {fresh['design'][key]!r}")
+        elif fresh["design"][key] != reg["design"][key]:
             out.append(f"design.{key}: code has {fresh['design'][key]!r}, registration froze {reg['design'][key]!r}")
     if fresh["reading_rule"] != reg["reading_rule"]:
         out.append(f"reading_rule: code has {fresh['reading_rule']!r}, registration froze {reg['reading_rule']!r}")
@@ -228,6 +260,22 @@ def _num(x):
 
 def _rate_row(e3, reader, est):
     return next((r for r in e3["rejection_rates"] if r["reader"] == reader and r["estimator"] == est), None)
+
+
+def _half_life(arm, est, kernel: str) -> float:
+    """Half-life of one human fit, in words; ``nan`` unless the fit is interior.
+
+    The kernel is the arm's own, since a delta fitted under one kernel run
+    through the other's formula reports the wrong rung.
+    """
+    from lcsa.kernels import d_half_from_delta
+
+    row = next((f for f in (arm or {}).get("fits") or [] if f["estimator"] == est), None)
+    delta = _num(row.get("delta_hat")) if row else float("nan")
+    if not (math.isfinite(delta) and delta > 0):
+        return float("nan")
+    h = float(d_half_from_delta(delta, kernel))
+    return h if math.isfinite(h) and h > 0 else float("nan")
 
 
 def _verdict(measured: dict, supported, falsified) -> dict:
@@ -330,6 +378,29 @@ def _score_one(pred: dict, summaries: dict, gates: dict) -> dict:
         share = _num(row["share_shift_over_one_rung"]) if row else float("nan")
         return _verdict({"share_shift_over_one_rung": share}, share >= sup["share_at_least"],
                         share < fal["share_below"])
+    if pred["id"] == 12:
+        # The registered statement restricts to the rows where the two spans
+        # differ, which is the probe's truncated median, not its overall one.
+        p = s.get("prefix_probe")
+        gap = _num(p.get("median_tv_gap_truncated")) if p else float("nan")
+        return _verdict({"median_tv_gap_truncated": gap}, gap <= sup["median_tv_gap_at_most"],
+                        gap > fal["median_tv_gap_above"])
+    if pred["id"] == 13:
+        unc = s.get("human_uncapped") or {}
+        kernel = unc.get("kernel", "power")
+        capped = _half_life(s.get("human"), pred["estimator"], kernel)
+        uncapped = _half_life(unc, pred["estimator"], kernel)
+        gap = (abs(math.log(uncapped) - math.log(capped))
+               if math.isfinite(capped) and math.isfinite(uncapped) else float("nan"))
+        # Whether the second arm is attested uncapped or merely deeper decides how
+        # much the statement's "uncapped-depth cache" is worth, so the scorecard
+        # carries it beside the number rather than leaving it in the leg summary.
+        return _verdict({"d_half_capped": capped, "d_half_uncapped": uncapped,
+                         "abs_log_half_life_gap": gap,
+                         "uncapped_verified": bool(unc.get("uncapped_verified")),
+                         "uncapped_attestation": unc.get("attestation")},
+                        gap <= sup["log_half_life_tolerance"],
+                        gap > sup["log_half_life_tolerance"])
     raise ValueError(f"no scorer for prediction {pred['id']}; the registration lists a prediction the code cannot score")
 
 

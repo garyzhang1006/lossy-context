@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Freeze the registration before any leg runs: the design constants, the eleven
+# Freeze the registration before any leg runs: the design constants, the thirteen
 # predictions with their thresholds, the reading rule and the gate branches go
 # to $LCSA_ART/registration.json with a SHA-256 sidecar, and the hash is
 # printed so the paper can quote it.  lcsa merge refuses to run without the

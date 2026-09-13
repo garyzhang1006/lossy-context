@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -63,3 +65,22 @@ def test_merge_refuses_shards_that_stop_short_of_the_declared_participants(tmp_p
     write_shard(tmp_path, "e5_participants", range(0, 3), [{"replicate": i} for i in range(3)])
     with pytest.raises(ValueError, match="3"):
         e5.merge(tmp_path, n_part=5)
+
+
+def test_an_absent_participant_file_leaves_the_audit_not_run(tmp_path):
+    """The raw cloze export is not distributed, so its absence must not raise."""
+    from lcsa.cli import main
+    from lcsa.store import save_corpus
+
+    cache = tmp_path / "cache.npz"
+    save_corpus(cache, make_corpus(n_targets=8, n_clusters=2, seed=5))
+    out = tmp_path / "e5"
+    assert main(["e5", "--cache", str(cache), "--out", str(out)]) == 0
+    res = json.loads((out / "e5_summary.json").read_text())
+    assert res["status"] == "not_run" and res["n_rows"] == 0 and res["summary"] == []
+    assert "--participants" in res["reason"]
+    # A path that was given and is not there is the same outcome, not a crash.
+    assert main(["e5", "--cache", str(cache), "--out", str(out),
+                 "--participants", str(tmp_path / "nope.csv")]) == 0
+    res = json.loads((out / "e5_summary.json").read_text())
+    assert res["status"] == "not_run" and "nope.csv" in res["reason"]

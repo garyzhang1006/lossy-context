@@ -17,10 +17,14 @@ from pathlib import Path
 
 import numpy as np
 
-from lcsa.baselines import context_slopes, hard_window_sweep, sweep_disagreement
+from lcsa.baselines import (context_slopes, decorativeness_check, hard_window_sweep,
+                            passage_slopes, sweep_disagreement)
 from lcsa.corpusdata import Corpus
+from lcsa.fitting import fit_constrained
+from lcsa.inference import score_test
 from lcsa.kernels import POWER
 from lcsa.likelihood import Model
+from lcsa.readers import reader_n0
 from lcsa.readingtime import RTResult, _fit_ll, _gauss_ll, reading_time_gain, spillover
 from lcsa.experiments import Artifacts
 from lcsa.experiments.shards import denull, read_shards, write_shard
@@ -29,7 +33,8 @@ log = logging.getLogger(__name__)
 
 __all__ = ["K_GRID", "gaze_table", "window_surprisal", "heldout_delta_ll", "sweep_reference",
            "argmax_picks", "summarise_argmax", "argmax_bootstrap", "rt_gain_table",
-           "run_sweep", "load_stage", "run_argmax_shard", "assemble", "merge", "run"]
+           "decorativeness", "run_sweep", "load_stage", "run_argmax_shard", "assemble",
+           "merge", "run"]
 
 #: The context-limitation grid, in words of preceding context.
 K_GRID = (0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
@@ -311,6 +316,34 @@ def rt_gain_table(
     return rows
 
 
+def _passage_statistic(corpus: Corpus, model: Model, kernel=POWER, seed: int = 0,
+                       null_fit=None) -> np.ndarray:
+    """Each passage's share of the efficient score, in cluster-robust units."""
+    st = score_test(corpus, model, kernel, null_fit=null_fit, n_starts=2, seed=seed,
+                    n_wild=0)
+    sd = float(np.sqrt(st.var_cr1))
+    return st.s_cluster / sd if sd > 0 else st.s_cluster
+
+
+def decorativeness(corpus: Corpus, model: Model, kernel=POWER, seed: int = 0) -> dict:
+    """The two model-free slopes against the statistic, on the same two readers.
+
+    The null reader is E3's plain floor: responses redrawn at each target's own
+    count from the human fit with ``delta`` pinned at zero, so the readers
+    differ in decay and in nothing else.  Everything is then per passage, which
+    is the unit all three scores are clustered on anyway.
+    """
+    null_fit = fit_constrained(corpus, model, kernel, n_starts=2, seed=seed)
+    null = reader_n0(corpus, null_fit.theta, model, seed=seed, kernel=kernel)
+    human_slopes, null_slopes = passage_slopes(corpus), passage_slopes(null)
+    return decorativeness_check(
+        human_slopes["entropy"], null_slopes["entropy"],
+        human_slopes["top1"], null_slopes["top1"],
+        _passage_statistic(corpus, model, kernel, seed, null_fit),
+        _passage_statistic(null, model, kernel, seed),
+    )
+
+
 STAGE_JSON = "e4_stage.json"
 
 
@@ -355,6 +388,10 @@ def run_sweep(
                                       & np.isfinite(spillover(np.ones(len(gaze)), passage,
                                                               position=position))).sum()),
              "model_free": context_slopes(corpus)}
+    # The registered falsifier needs two clusters to separate and a response in
+    # them; a corpus with neither leaves the row absent rather than asserted.
+    if corpus.n_clusters >= 2 and corpus.total_responses > 0:
+        stage["decorativeness"] = decorativeness(corpus, models[0], kernel, seed)
     if fitted:
         rows = rt_gain_table(corpus, gaze, controls, passage, fitted, kernel=kernel,
                              n_folds=5, use_mixed=use_mixed, seed=seed, position=position)
@@ -417,6 +454,8 @@ def assemble(stage: dict, boot_rows: list[dict], out_dir) -> dict:
         res["rt_gain"] = stage["rt_gain"]
     res["hard_window_likelihood"] = stage["hard_window_likelihood"]
     res["hard_window_agreement"] = stage["hard_window_agreement"]
+    if "decorativeness" in stage:
+        res["decorativeness"] = stage["decorativeness"]
     art.save("e4_summary", res)
     return res
 

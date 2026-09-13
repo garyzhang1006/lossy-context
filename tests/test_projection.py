@@ -240,3 +240,26 @@ def test_explained_share_is_one_when_the_direction_is_the_mismatch(data):
         dirs.setdefault("SELF", [None] * len(data))[t.index] = np.log(p_emp) - np.log(fit.q)
     es = explained_share(data, th0, NAIVE, dirs)
     assert es["share_explained"] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_the_constrained_fit_pins_the_global_fraction_near_one_at_120_targets():
+    """Remark 1 as a shape, on a corpus with a known injected decay.
+
+    The published numbers come from `lcsa selftest`, which this does not
+    reproduce; what it guards is the ordering the remark turns on, namely a
+    global fraction pinned just under one while the per-target fraction falls
+    well below it and falls further under the wider repaired span.
+    """
+    from lcsa.fitting import fit_constrained
+    corpus = draw_true_delta(make_corpus(n_targets=120, n_clusters=12, seed=41), 0.2, seed=42)
+    got = {}
+    for name, model in (("naive", NAIVE), ("repaired", REPAIRED)):
+        theta = fit_constrained(corpus, model, n_starts=1, seed=0).theta
+        g = global_residual(corpus, theta, model)
+        assert g.n_targets_used == 120
+        got[name] = (g.fraction, g.fraction_per_target)
+    assert got["naive"][0] == pytest.approx(0.99999, abs=5e-5)
+    assert got["repaired"][0] == pytest.approx(0.99994, abs=5e-5)
+    assert got["naive"][1] == pytest.approx(0.859, abs=5e-3)
+    assert got["repaired"][1] == pytest.approx(0.333, abs=5e-3)
+    assert got["repaired"][1] < got["naive"][1]

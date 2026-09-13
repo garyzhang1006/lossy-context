@@ -46,6 +46,43 @@ def test_ladder_deltas_follow_the_kernel():
         assert retention(np.array([d_half]), dl, LINEAR)[0] == pytest.approx(0.5, rel=1e-9)
 
 
+def _counts(corpus):
+    return [np.asarray(t.n) for t in corpus]
+
+
+def test_n0_prime_carries_its_target_level_tilt_by_default():
+    """The registered design gives N0-prime a passage tilt *and* a smaller
+    target-level one; the second used to default to zero, so the only caller
+    passing its scale positionally never ran it."""
+    corpus = make_corpus(n_targets=24, n_clusters=6, seed=9)
+    corpus = corpus.with_counts([np.full(t.V, 8.0) for t in corpus])
+    theta0 = np.array([0.0, 0.1, 0.9])
+    sigma = 0.8
+
+    assert 0.0 < readers.TARGET_TILT_RATIO < 1.0
+    default = readers.reader_n0_prime(corpus, theta0, NAIVE, sigma, seed=3)
+    tied = readers.reader_n0_prime(corpus, theta0, NAIVE, sigma, seed=3,
+                                   sigma_target=readers.TARGET_TILT_RATIO * sigma)
+    off = readers.reader_n0_prime(corpus, theta0, NAIVE, sigma, seed=3, sigma_target=0.0)
+
+    for a, b in zip(_counts(default), _counts(tied)):
+        assert np.array_equal(a, b)
+    assert any(not np.array_equal(a, b) for a, b in zip(_counts(default), _counts(off)))
+
+
+def test_the_design_effect_bisection_still_converges_with_the_target_tilt():
+    """The target-level component is tied to the passage scale precisely so that
+    the single bisection on ``sigma_passage`` still calibrates the design."""
+    corpus = make_corpus(n_targets=40, n_clusters=8, seed=10)
+    corpus = corpus.with_counts([np.full(t.V, 12.0) for t in corpus])
+    cal = readers.calibrate_n0_prime(corpus, np.array([0.0, 0.1, 0.9]), NAIVE,
+                                     target_design_effect=2.5, seed=4, n_rep=2,
+                                     n_iter=8, tol=0.1)
+    assert cal["converged"] is True
+    assert cal["at_bound"] is False
+    assert cal["design_effect"] == pytest.approx(2.5, rel=0.1)
+
+
 def _stub_calibration_search(monkeypatch, table):
     """Drive the bisection off a deterministic design effect per tilt scale.
 
@@ -57,7 +94,7 @@ def _stub_calibration_search(monkeypatch, table):
     import lcsa.inference as inference
 
     monkeypatch.setattr(readers, "reader_n0_prime",
-                        lambda corpus, theta0, model, sig, **kw: float(sig))
+                        lambda corpus, theta0, model, sigma_passage, **kw: float(sigma_passage))
     monkeypatch.setattr(inference, "score_test",
                         lambda c, *a, **kw: SimpleNamespace(design_effect=table(float(c))))
 

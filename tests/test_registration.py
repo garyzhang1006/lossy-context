@@ -1,6 +1,7 @@
 """The frozen registration: written once, hashed, checked at merge, scored from."""
 
 import json
+import math
 
 import pytest
 
@@ -113,3 +114,73 @@ def test_g5_failure_voids_everything_downstream(tmp_path):
     (tmp_path / "e3_summary.json").write_text(json.dumps(e3))
     with pytest.raises(ValueError, match="were registered"):
         score(reg, tmp_path)
+
+
+def _score_12(tmp_path, probe) -> dict:
+    reg = build_registration(n_rep=4, n_boot=4, legs=("e1",))
+    (tmp_path / "e1_summary.json").write_text(
+        json.dumps({"prefix_probe": probe} if probe else {}))
+    return {r["id"]: r for r in score(reg, tmp_path)["predictions"]}[12]
+
+
+def test_prediction_12_reads_the_rows_where_the_two_spans_differ(tmp_path):
+    # The overall median is far above the threshold in every case here, so a
+    # scorer reading it instead of the truncated median gets the other verdict.
+    got = _score_12(tmp_path, {"median_tv_gap": 0.40, "median_tv_gap_truncated": 0.01,
+                               "n_truncated_pairs": 40})
+    assert got["status"] == "supported" and got["measured"]["median_tv_gap_truncated"] == 0.01
+    assert _score_12(tmp_path, {"median_tv_gap": 0.40,
+                                "median_tv_gap_truncated": 0.06})["status"] == "falsified"
+    assert _score_12(tmp_path, {"median_tv_gap": 0.40,
+                                "median_tv_gap_truncated": 0.03})["status"] == "indeterminate"
+    absent = _score_12(tmp_path, None)
+    assert absent["status"] == "indeterminate"
+    assert math.isnan(absent["measured"]["median_tv_gap_truncated"])
+
+
+def _score_13(tmp_path, delta_capped, uncapped) -> dict:
+    reg = build_registration(n_rep=4, n_boot=4, legs=("e3",))
+    e3 = {"rejection_rates": [], "g5": {"passed": True},
+          "human": {"fits": [{"estimator": "naive", "delta_hat": delta_capped}]}}
+    if uncapped is not None:
+        e3["human_uncapped"] = uncapped
+    (tmp_path / "e3_summary.json").write_text(json.dumps(e3))
+    return {r["id"]: r for r in score(reg, tmp_path)["predictions"]}[13]
+
+
+def test_prediction_13_records_whether_the_uncapped_arm_was_verified(tmp_path):
+    """The two arms give the same gap whether the second one was attested
+    uncapped or merely deeper, so the scorecard has to carry which it was."""
+    fits = [{"estimator": "naive", "delta_hat": 0.30}]
+    attested = _score_13(tmp_path, 0.316, {
+        "kernel": "power", "fits": fits, "uncapped_verified": True,
+        "attestation": "all 16 targets cache their full context, the longest being 13 words"})
+    assert attested["status"] == "supported"
+    assert attested["measured"]["uncapped_verified"] is True
+    assert "full context" in attested["measured"]["uncapped_attestation"]
+
+    older = _score_13(tmp_path, 0.316, {"kernel": "power", "fits": fits})
+    assert older["status"] == "supported"
+    assert older["measured"]["uncapped_verified"] is False
+    assert older["measured"]["uncapped_attestation"] is None
+
+
+def test_prediction_13_compares_half_lives_not_the_deltas_behind_them(tmp_path):
+    got = _score_13(tmp_path, 0.316, {"kernel": "power",
+                                      "fits": [{"estimator": "naive", "delta_hat": 0.30}]})
+    assert got["status"] == "supported"
+    assert got["measured"]["d_half_capped"] == pytest.approx(7.966, abs=1e-3)
+    assert got["measured"]["abs_log_half_life_gap"] == pytest.approx(0.1305, abs=1e-3)
+    # 0.25 against 0.316 is 0.234 log units apart as deltas and 0.63 as
+    # half-lives, so a scorer comparing deltas would call this one supported.
+    far = _score_13(tmp_path, 0.316, {"kernel": "power",
+                                      "fits": [{"estimator": "naive", "delta_hat": 0.25}]})
+    assert far["status"] == "falsified"
+    assert far["measured"]["abs_log_half_life_gap"] == pytest.approx(0.6326, abs=1e-3)
+    absent = _score_13(tmp_path, 0.316, None)
+    assert absent["status"] == "indeterminate"
+    assert math.isnan(absent["measured"]["d_half_uncapped"])
+    # A fit at the zero-decay boundary has no half-life to compare.
+    flat = _score_13(tmp_path, 0.316, {"kernel": "power",
+                                       "fits": [{"estimator": "naive", "delta_hat": 0.0}]})
+    assert flat["status"] == "indeterminate"

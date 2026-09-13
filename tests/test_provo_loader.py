@@ -267,3 +267,97 @@ def test_a_blank_response_cell_loads_and_is_counted_by_the_gate(tmp_path):
     provo = load_provo(tmp_path, require_eye=False)
     raw, _ = read_provo_csv(tmp_path / "Provo_Corpus-Predictability_Norms.csv")
     assert g0_data_integrity(raw, provo).measured["empty_responses"] == 1
+
+
+def test_the_loader_records_the_digest_of_every_file_it_read(provo_dir):
+    """The counts in the paper belong to one release, and the digest says which."""
+    import hashlib
+
+    provo = load_provo(provo_dir, require_eye=True)
+    for name, digest in provo.source_sha256.items():
+        on_disk = hashlib.sha256((provo_dir / name).read_bytes()).hexdigest()
+        assert digest == on_disk
+    assert "Provo_Corpus-Predictability_Norms.csv" in provo.source_sha256
+    assert "Provo_Corpus-Eyetracking_Data.csv" in provo.source_sha256
+    assert provo.summary()["source_sha256"] == provo.source_sha256
+
+
+def test_gate_g0_records_the_source_digest_it_audited(provo_dir):
+    raw, _ = read_provo_csv(provo_dir / "Provo_Corpus-Predictability_Norms.csv")
+    provo = load_provo(provo_dir)
+    g = g0_data_integrity(raw, provo)
+    assert g.measured["provo_source_sha256"] == provo.source_sha256
+
+
+# The one disagreement the two real Provo releases carry: the norms tokenise a
+# contraction into two numbered words where the eye-tracking file keeps one, so
+# the eye numbering runs a word behind the norms for the rest of that passage.
+_CONTRACTION_NORMS = ["It", "does", "n't", "matter", "now"]
+_CONTRACTION_EYE = ["It", "doesn't", "matter", "now"]
+_EYE_CONTENT = {"It": "Function", "doesn't": "Function",
+                "matter": "Content", "now": "Content"}
+
+
+def _contraction_dir(tmp_path, norms_carry_content=True):
+    nrows, erows = [], []
+    for i, word in enumerate(_CONTRACTION_NORMS, start=FIRST_WORD_NUMBER):
+        for resp, count in ((word.lower(), 20), ("thing", 20)):
+            row = {"Text_ID": 3, "Word_Number": i, "Word": word,
+                   "Response": resp, "Response_Count": count,
+                   "Total_Response_Count": 40}
+            if norms_carry_content:
+                row["Word_Content_Or_Function"] = "Content" if i % 2 else "Function"
+            nrows.append(row)
+    for i, word in enumerate(_CONTRACTION_EYE, start=FIRST_WORD_NUMBER):
+        for pid in range(4):
+            erows.append({"Text_ID": 3, "Word_Number": i, "Word": word,
+                          "Participant_ID": f"p{pid}",
+                          "Word_Content_Or_Function": _EYE_CONTENT[word],
+                          "IA_FIRST_RUN_DWELL_TIME": 200 + 10 * pid + 5 * i,
+                          "IA_LENGTH": len(word)})
+    pd.DataFrame(nrows).to_csv(
+        tmp_path / "Provo_Corpus-Predictability_Norms.csv", index=False)
+    pd.DataFrame(erows).to_csv(
+        tmp_path / "Provo_Corpus-Eyetracking_Data.csv", index=False)
+    return tmp_path
+
+
+def test_a_contraction_the_norms_split_is_renumbered_not_quarantined(tmp_path):
+    """Quarantining this shift would throw away most of the real gaze arm."""
+    provo = load_provo(_contraction_dir(tmp_path))
+    assert provo.arm_word_mismatches == 0
+    # "It" keeps 2, "doesn't" takes the number of "does", and the two words
+    # after it move up by one; 4 is the "n't" fragment, which has no gaze.
+    assert sorted(set(provo.gaze["word_number"])) == [2, 3, 5, 6]
+    assert provo.intersection_size == 4
+    gaze_at = provo.gaze.groupby("word_number")["gaze"].mean()
+    # word_number 5 must carry the times recorded for "matter", not for "n't".
+    assert gaze_at[5] == pytest.approx(200 + 15 + 5 * 4)
+
+
+def test_a_rotation_is_still_quarantined_after_the_split_repair(tmp_path, monkeypatch):
+    """The repair must not license any renumbering that merely makes words line up."""
+    monkeypatch.setitem(PASSAGES, 3, ["He", "said", "it", "had", "been", "gone"])
+    norms = _norms_rows()
+    norms.to_csv(tmp_path / "Provo_Corpus-Predictability_Norms.csv", index=False)
+    _eye_rows(skip=(), shift=(3,)).to_csv(
+        tmp_path / "Provo_Corpus-Eyetracking_Data.csv", index=False)
+    provo = load_provo(tmp_path)
+    assert provo.arm_word_mismatches == len(PASSAGES[3])
+    assert 3 not in set(provo.gaze["text_id"])
+
+
+def test_is_content_falls_back_to_the_eye_file_when_the_norms_omit_it(tmp_path):
+    """Without it every target reads as a function word and one feature is zero."""
+    provo = load_provo(_contraction_dir(tmp_path, norms_carry_content=False))
+    flags = dict(zip(provo.words["word_number"], provo.words["is_content"]))
+    assert flags[2] == 0.0 and flags[3] == 0.0
+    assert flags[5] == 1.0 and flags[6] == 1.0
+    assert np.isnan(flags[4])  # the fragment the eye file never names
+
+
+def test_the_norms_content_column_is_kept_when_it_is_present(tmp_path):
+    """The eye file is a fallback, so it must not overwrite the norms."""
+    provo = load_provo(_contraction_dir(tmp_path))
+    flags = dict(zip(provo.words["word_number"], provo.words["is_content"]))
+    assert [flags[i] for i in (2, 3, 4, 5, 6)] == [0.0, 1.0, 0.0, 1.0, 0.0]

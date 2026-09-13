@@ -37,7 +37,7 @@ __all__ = ["h_lexical", "within_passage_rho", "build_h_topic", "build_h_order", 
            "null_replicates", "n0_prime_replicates", "summarise_rates", "replicate_rates",
            "fit_and_profile", "contrast_replicates", "summarise_contrast", "paired_contrast",
            "prepare", "save_prepared", "load_prepared", "run_replicate_shard", "run_human",
-           "run_contrast_shard", "assemble", "merge", "run", "FLOORS"]
+           "uncapped_human_fits", "run_contrast_shard", "assemble", "merge", "run", "FLOORS"]
 
 
 def h_lexical(corpus: Corpus, model: Model, kernel=POWER, seed: int = 0) -> list[np.ndarray]:
@@ -149,11 +149,21 @@ def build_nulls(
     return out
 
 
+#: Multistart budget of the unconstrained fit, and of the constrained fit inside
+#: the score test, on *both* arms of the rejection-rate table.  A deeper search
+#: can only raise the attained likelihood, so an arm searched harder than the
+#: one it is compared against would carry that advantage into its rejection
+#: rate; the human arm's budget is the one kept, because dropping to the
+#: replicate path's would weaken the headline estimate to save replicate time.
+FIT_STARTS = 3
+SCORE_STARTS = 2
+
+
 def fit_and_profile(corpus: Corpus, model: Model, kernel=POWER, seed: int = 0,
                     profile: bool = True) -> dict:
     """One fit with its cluster-robust test, naive LR and cluster-scaled region."""
-    f = fit(corpus, model, kernel, n_starts=3, seed=seed)
-    st = score_test(corpus, model, kernel, n_starts=2, seed=seed)
+    f = fit(corpus, model, kernel, n_starts=FIT_STARTS, seed=seed)
+    st = score_test(corpus, model, kernel, n_starts=SCORE_STARTS, seed=seed)
     lr = lr_test(corpus, model, kernel, full_fit=f, null_fit=st.null_fit)
     deff = st.design_effect
     row = {
@@ -194,10 +204,15 @@ FLOORS = ("N0", "N0-PRIME")
 
 
 def _replicate_fit(corp: Corpus, model: Model, kernel, seed: int) -> dict:
-    """The score test, the fit and the naive LR on one replicate corpus."""
+    """The score test, the fit and the naive LR on one replicate corpus.
+
+    The budgets are :data:`SCORE_STARTS` and :data:`FIT_STARTS`, the same ones
+    :func:`fit_and_profile` gives the human counts, so the two arms of the
+    rejection-rate table are searched equally.
+    """
     try:
-        st = score_test(corp, model, kernel, n_starts=1, seed=seed)
-        f = fit(corp, model, kernel, n_starts=2, seed=seed)
+        st = score_test(corp, model, kernel, n_starts=SCORE_STARTS, seed=seed)
+        f = fit(corp, model, kernel, n_starts=FIT_STARTS, seed=seed)
         lr = lr_test(corp, model, kernel, full_fit=f, null_fit=st.null_fit)
     except Exception as exc:
         return {"failed": True, "error": str(exc)}
@@ -263,8 +278,8 @@ def n0_prime_replicates(
     rows = []
     for model in models:
         for b in reps:
-            c = reader_n0_prime(corpus, theta0, primary, sigma, seed=seed + 5000 + b,
-                                kernel=kernel)
+            c = reader_n0_prime(corpus, theta0, primary, sigma_passage=sigma,
+                                seed=seed + 5000 + b, kernel=kernel)
             row = _replicate_fit(c, model, kernel, seed)
             if row["failed"]:
                 log.debug("N0-PRIME replicate %d failed under %s: %s", b, model.name,
@@ -352,11 +367,17 @@ def contrast_replicates(
     reps=range(200),
     seed: int = 0,
 ) -> list[dict]:
-    """Human and null ``delta`` refitted on the same passage resample, per replicate."""
+    """Human and null ``delta`` refitted on the same passage resample, per replicate.
+
+    The null arm is refitted on the *draw*, read off ``sub.source_clusters``:
+    the resample relabels its clusters 0..C-1, so reconstructing the draw from
+    ``sub.cluster_index`` would hand every replicate the whole corpus and
+    unpair the contrast without leaving a trace in its standard error.
+    """
     names = list(null_corpora)
 
     def statistic(sub: Corpus) -> dict:
-        idx = np.unique(sub.cluster_index)
+        idx = np.asarray(sub.source_clusters).tolist()
         out = {}
         f = fit(sub, model, kernel, n_starts=1, seed=seed)
         out["human"] = f.delta
@@ -369,11 +390,15 @@ def contrast_replicates(
     return cluster_bootstrap(human, statistic, seed=seed, reps=reps)
 
 
-def summarise_contrast(reps: list[dict], names, margin: float = 0.25) -> dict:
+def summarise_contrast(reps: list[dict], names, margin: float = 0.25,
+                       df: float | None = None) -> dict:
     """TOST on ``log delta_human - log delta_null`` from bootstrap replicate records.
 
     A replicate where either arm hits the boundary has an undefined log
-    difference; it is counted and excluded, never replaced by a number.
+    difference, and it is counted and excluded, never replaced by a number.
+    ``df`` is the cluster count less one, which the callers supply so that the
+    equivalence test reads off the same reference distribution as every other
+    interval here.
     """
     hs = np.array([r.get("human", np.nan) for r in reps], dtype=np.float64)
     arms = [np.array([r.get(nm, np.nan) for r in reps], dtype=np.float64) for nm in names]
@@ -396,7 +421,7 @@ def summarise_contrast(reps: list[dict], names, margin: float = 0.25) -> dict:
                 float(np.corrcoef(np.log(hs[ok]), np.log(ns[ok]))[0, 1])
                 if ok.sum() > 3 else float("nan")
             )
-        t = tost(d[ok], margin=margin)
+        t = tost(d[ok], margin=margin, df=df)
         res["contrasts"][nm] = {
             "mean_log_diff": float(np.mean(d[ok])) if ok.any() else float("nan"),
             "se_log_diff": float(np.std(d[ok], ddof=1)) if ok.sum() > 1 else float("nan"),
@@ -406,6 +431,7 @@ def summarise_contrast(reps: list[dict], names, margin: float = 0.25) -> dict:
             "tost_p": t.p,
             "tost_equivalent": bool(t.equivalent),
             "tost_margin": float(margin),
+            "tost_df": float(t.df),
         }
     return res
 
@@ -426,7 +452,8 @@ def paired_contrast(
     needs.
     """
     reps = contrast_replicates(human, null_corpora, model, kernel, range(n_boot), seed)
-    return summarise_contrast(reps, list(null_corpora), margin)
+    return summarise_contrast(reps, list(null_corpora), margin,
+                              df=float(human.n_clusters - 1))
 
 
 # -- stages -------------------------------------------------------------------
@@ -650,6 +677,64 @@ def reading_rule(corpus: Corpus, prepared: dict, primary: Model, debiased: list[
             "estimator": primary.name, "jeffreys_alpha": 0.5}
 
 
+def _uncapped_attestation(uncapped: Corpus) -> dict:
+    """What the cache's own build record says about the cap it was written under.
+
+    A cache deeper than the capped arm can still be capped, so the arm counts as
+    verified only when the build recorded every target's untruncated context
+    length and the cap cut none of them.  A cache built before those fields
+    existed cannot say either way, and the reason it cannot is recorded with the
+    arm rather than left to the reader to guess.
+    """
+    if uncapped.n_context is None:
+        return {
+            "uncapped_verified": False,
+            "max_depth": uncapped.max_depth,
+            "attestation": "the cache records no per-target context length, so this arm "
+                           "rests on the depth comparison alone; rebuild it with a "
+                           "current `lcsa build` to attest that nothing was truncated",
+        }
+    n_ctx = np.asarray(uncapped.n_context)
+    depths = np.array([t.K for t in uncapped], dtype=np.int64)
+    truncated = int(np.count_nonzero(depths < n_ctx))
+    if truncated:
+        raise ValueError(
+            f"{truncated} of {uncapped.n_targets} targets of the uncapped cache are still "
+            f"truncated at max_depth {uncapped.max_depth}; prediction 13 needs an arm whose "
+            "zero-decay member conditions on the full passage prefix, so rebuild it with "
+            f"--max-depth at least {int(n_ctx.max())}")
+    return {
+        "uncapped_verified": True,
+        "max_depth": uncapped.max_depth,
+        "attestation": f"all {uncapped.n_targets} targets cache their full context, the "
+                       f"longest being {int(n_ctx.max())} words",
+    }
+
+
+def uncapped_human_fits(uncapped: Corpus, capped: Corpus, models, kernel=POWER,
+                        seed: int = 0) -> dict:
+    """The human fits repeated on a cache built without the depth cap.
+
+    Registered prediction 13 asks whether lifting ``BuildConfig.max_depth``
+    moves the fitted half-life, so the two arms must differ in depth alone: a
+    cache that is not deeper is a mis-passed directory, not a trivial pass.
+    """
+    if uncapped.n_targets != capped.n_targets:
+        raise ValueError(
+            f"the uncapped cache has {uncapped.n_targets} targets and the capped one "
+            f"{capped.n_targets}; both arms are the same targets rebuilt at a larger "
+            "--max-depth")
+    if uncapped.mean_K <= capped.mean_K:
+        raise ValueError(
+            f"the uncapped cache has mean depth {uncapped.mean_K:.3f}, no deeper than the "
+            f"capped {capped.mean_K:.3f}; rebuild it with --max-depth above the longest "
+            "passage prefix")
+    return {"kernel": kernel.name, "mean_K": float(uncapped.mean_K),
+            "mean_K_capped": float(capped.mean_K),
+            **_uncapped_attestation(uncapped),
+            "fits": [fit_and_profile(uncapped, m, kernel, seed=seed) for m in models]}
+
+
 def run_human(
     corpus: Corpus,
     prepared: dict,
@@ -657,11 +742,14 @@ def run_human(
     out_dir,
     kernel=POWER,
     seed: int = 0,
+    uncapped: Corpus | None = None,
 ) -> dict:
     """Stage three of E3: the human fits, residual fractions and precision inputs.
 
     It runs after the null outputs are written, because the order is the only
     thing keeping the comparison from being adjusted after the fact.
+    ``uncapped`` is the same human counts on a cache built without the depth
+    cap, and its fits are recorded beside the capped ones for prediction 13.
     """
     _check_primary(prepared, models, kernel)
     art = Artifacts(out_dir, "e3")
@@ -715,6 +803,8 @@ def run_human(
     }
     human = {"fits": fits, "residual_fraction": resid, "residual_debiased": debiased,
              "implied_bias": bias_rows, "reading_rule": rule, "precision": precision}
+    if uncapped is not None:
+        human["uncapped"] = uncapped_human_fits(uncapped, corpus, models, kernel, seed=seed)
     art.save("e3_human_stage", human)
     return human
 
@@ -758,7 +848,8 @@ def assemble(
     art.save("e3_nulls", res)
     if human is not None:
         names = [nm for nm in prepared["readers"] if nm not in FLOORS]
-        contrast = (summarise_contrast(contrast_reps, names, margin)
+        contrast = (summarise_contrast(contrast_reps, names, margin,
+                                       df=float(prepared["n_clusters"] - 1))
                     if contrast_reps and names else None)
         r_pair = float("nan")
         if contrast and contrast.get("contrasts"):
@@ -777,6 +868,8 @@ def assemble(
                                prec["within_passage_rho"],
                                n_clusters=int(prepared["n_clusters"])),
         }
+        if human.get("uncapped"):
+            res["human_uncapped"] = human["uncapped"]
         art.save("e3_human", res["human"])
     art.save("e3_summary", res)
     return res
@@ -829,6 +922,7 @@ def run(
     seed: int = 0,
     fit_human: bool = True,
     readers=None,
+    uncapped: Corpus | None = None,
 ) -> dict:
     """Full E3 leg in one process: floors, substantive nulls, G5, then the human fit."""
     prepared = prepare(corpus, models, out_dir, h_specs, kernel=kernel, seed=seed,
@@ -839,7 +933,8 @@ def run(
                                     kernel=kernel, seed=seed)
     human = contrast = None
     if fit_human:
-        human = run_human(corpus, prepared, models, out_dir, kernel=kernel, seed=seed)
+        human = run_human(corpus, prepared, models, out_dir, kernel=kernel, seed=seed,
+                          uncapped=uncapped)
         contrast = run_contrast_shard(corpus, prepared, models, out_dir, range(n_boot),
                                       kernel=kernel, seed=seed)
     return assemble(prepared, rows, out_dir, human, contrast)

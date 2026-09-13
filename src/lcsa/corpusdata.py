@@ -83,6 +83,9 @@ class Corpus:
         word_ids: Sequence[np.ndarray] | None = None,
         feature_names: Sequence[str] | None = None,
         target_slots: Sequence[int] | None = None,
+        n_context: Sequence[int] | None = None,
+        max_depth: int | None = None,
+        keys: Sequence[Sequence[int]] | None = None,
     ) -> None:
         T = len(P_list)
         if not (len(n_list) == len(u_list) == len(f_list) == len(g_list) == len(clusters) == T):
@@ -102,6 +105,11 @@ class Corpus:
         # Dense 0..C-1 relabelling, so downstream code can use bincount safely.
         remap = {int(c): i for i, c in enumerate(uniq)}
         self.cluster_index = np.array([remap[int(c)] for c in self.clusters], dtype=np.int64)
+        # Which cluster of the corpus this one was drawn from, in that corpus's
+        # dense index.  A corpus built directly stands for itself; only
+        # :meth:`subset_clusters` overwrites it, and it is the only record of a
+        # bootstrap draw that survives, since the drawn copies are relabelled.
+        self.source_clusters = np.arange(self.n_clusters, dtype=np.int64)
 
         self.M = int(np.asarray(f_list[0]).shape[1]) if np.asarray(f_list[0]).ndim == 2 else 0
         self.feature_names = (
@@ -180,6 +188,31 @@ class Corpus:
         if self.target_slots.shape != (T,):
             raise ValueError(
                 f"target_slots has shape {self.target_slots.shape}, expected {(T,)}"
+            )
+
+        # The build's depth cap and each target's untruncated context length are
+        # the only record of how deep the cache *could* have gone: K alone cannot
+        # tell a cache that was never cut from one cut above the passages it
+        # happened to hold.  Caches written before these existed carry None, and
+        # every consumer treats that as "unattested" rather than as a failure.
+        self.max_depth = int(max_depth) if max_depth is not None else None
+        self.n_context = (
+            np.asarray(n_context, dtype=np.int64) if n_context is not None else None
+        )
+        if self.n_context is not None and self.n_context.shape != (T,):
+            raise ValueError(
+                f"n_context has shape {self.n_context.shape}, expected {(T,)}"
+            )
+        # A target's ``(text_id, word_number)`` identity, which is what
+        # ``targets.csv`` lists and what every artifact produced beside the cache
+        # has to key on: a positional index would silently point at a different
+        # target the moment ``build_corpus``'s ``select`` predicate changed.
+        # Carried under the same rule as the two above, so a cache written
+        # before it existed loads unchanged with ``keys`` at None.
+        self.keys = np.asarray(keys, dtype=np.int64) if keys is not None else None
+        if self.keys is not None and self.keys.shape != (T, 2):
+            raise ValueError(
+                f"keys has shape {self.keys.shape}, expected {(T, 2)}"
             )
 
         self._cache: dict[int, Target] = {}
@@ -262,9 +295,13 @@ class Corpus:
 
         Targets are concatenated in the order the clusters are given, and each
         drawn copy receives a fresh cluster label, so a passage drawn twice
-        contributes two independent clusters as the bootstrap requires.
+        contributes two independent clusters as the bootstrap requires.  That
+        relabelling destroys the draw, so it is recorded on the returned corpus
+        as ``source_clusters``: a caller that has to refit a second corpus on
+        the same passages reads it from there rather than trying to recover it
+        from ``cluster_index``, which is ``arange(C)`` by construction.
         """
-        P, n, u, f, g, cl, wid, ts = [], [], [], [], [], [], [], []
+        P, n, u, f, g, cl, wid, ts, nc, ky = [], [], [], [], [], [], [], [], [], []
         for new_c, c in enumerate(cluster_index):
             members = np.flatnonzero(self.cluster_index == int(c))
             if members.size == 0:
@@ -279,4 +316,16 @@ class Corpus:
                 cl.append(new_c)
                 wid.append(tg.word_ids)
                 ts.append(tg.target_slot)
-        return Corpus(P, n, u, f, g, cl, wid, self.feature_names, ts)
+                if self.n_context is not None:
+                    nc.append(int(self.n_context[int(t)]))
+                if self.keys is not None:
+                    # A passage drawn twice contributes its targets twice, so the
+                    # keys of the draw repeat as the rows do; they identify the
+                    # target a row came from and are not unique in a bootstrap.
+                    ky.append([int(x) for x in self.keys[int(t)]])
+        sub = Corpus(P, n, u, f, g, cl, wid, self.feature_names, ts,
+                     n_context=nc if self.n_context is not None else None,
+                     max_depth=self.max_depth,
+                     keys=ky if self.keys is not None else None)
+        sub.source_clusters = np.asarray(cluster_index, dtype=np.int64)
+        return sub

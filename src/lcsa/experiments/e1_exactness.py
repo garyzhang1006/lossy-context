@@ -296,13 +296,19 @@ def residual_table(readers: dict[str, Corpus], models, kernel=POWER,
                     "alignment": g.alignment,
                     "span_dim_mean": rep.span_dim_mean,
                     "n_targets": rep.n_targets_used,
+                    "nuisance_at_bound": bool(null.nuisance_at_bound),
                 })
     return rows
 
 
 def run(corpus: Corpus, models, out_dir, kernel=POWER, sub_caches=None,
-        d_half_true: float = 8.0, seed: int = 0) -> dict:
-    """Full E1 leg: exactness, gradients, sensitivity, G2, residuals, bridging."""
+        d_half_true: float = 8.0, seed: int = 0, prefix_probe=None) -> dict:
+    """Full E1 leg: exactness, gradients, sensitivity, G2, residuals, bridging.
+
+    ``prefix_probe`` is the summary block of ``prefix_probe.json``; the probe
+    itself needs the reference on a GPU, so it runs as its own command and the
+    leg only folds its summary into ``e1_summary`` for prediction 12 to score.
+    """
     art = Artifacts(out_dir, "e1")
     res = {"exactness": exactness_report(kernel=kernel)}
     res["gradients"] = [likelihood_gradient_check(corpus, m, kernel, seed=seed) for m in models]
@@ -316,5 +322,7 @@ def run(corpus: Corpus, models, out_dir, kernel=POWER, sub_caches=None,
     if sub_caches:
         res["bridging"] = bridging_report(corpus, sub_caches, models[0], d_half_true,
                                           kernel, seed=seed)
+    if prefix_probe:
+        res["prefix_probe"] = dict(prefix_probe)
     art.save("e1_summary", res)
     return res

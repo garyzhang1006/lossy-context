@@ -158,8 +158,8 @@ def cmd_build(args) -> int:
         "seconds": dt, "targets": len(corpus), "contexts": ctx,
         "contexts_per_second": ctx / dt if dt > 0 else None,
         "tokens_forwarded": tokens, "n_params": n_params, "tflops": tflops,
-        "passed": g1.passed, "threshold": 2.0,
-        "note": "below 2.0 TFLOP/s the registration swaps the primary reference to "
+        "passed": g1.passed, "threshold": 2.5,
+        "note": "below 2.5 TFLOP/s the registration swaps the primary reference to "
                 "Qwen2.5-0.5B before G3 and G4 run",
     }, indent=2, default=str))
     log.info("G1 %s: %.2f TFLOP/s over %d tokens", "passed" if g1.passed else "FAILED",
@@ -217,11 +217,27 @@ def cmd_e1(args) -> int:
 
     _ensure_out(args.out)
     corpus = _load(args)
+    probe = None
+    if args.prefix_probe:
+        p = Path(args.prefix_probe)
+        if not p.exists():
+            raise SystemExit(f"prefix probe not found: {p}. Run `lcsa prefix-probe` first.")
+        probe = json.loads(p.read_text())["summary"]
+    subs = None
+    if args.sub_caches:
+        from lcsa.store import load_sub_caches
+
+        p = Path(args.sub_caches)
+        if not p.exists():
+            raise SystemExit(f"subset caches not found: {p}. Run `lcsa sub-cache` first.")
+        subs = load_sub_caches(p, corpus)
     res = run(corpus, _models(args.estimators), args.out, kernel=_kernel(args),
-              seed=args.seed)
+              seed=args.seed, prefix_probe=probe, sub_caches=subs)
     print(json.dumps({"exactness_passed": res["exactness"]["passed"],
                       "gradients_passed": all(g["passed"] for g in res["gradients"]),
-                      "g2_passed": res["g2"].passed}, indent=2))
+                      "g2_passed": res["g2"].passed,
+                      "bridging_targets": (res["bridging"]["n_targets"]
+                                           if "bridging" in res else None)}, indent=2))
     return 0
 
 
@@ -329,6 +345,18 @@ def _e3_h_specs(args, corpus) -> dict:
     return h_specs
 
 
+def _e3_uncapped(args):
+    """The uncapped-depth cache of prediction 13, or ``None`` when it was not asked for."""
+    from lcsa.store import load_corpus
+
+    if not args.uncapped_cache:
+        return None
+    p = Path(args.uncapped_cache)
+    if not p.exists():
+        raise SystemExit(f"uncapped cache not found: {p}. Build it with a larger --max-depth.")
+    return load_corpus(p)
+
+
 def cmd_e3(args) -> int:
     from lcsa.experiments import e3_nulls as e3
 
@@ -338,10 +366,11 @@ def cmd_e3(args) -> int:
     kernel = _kernel(args)
     readers = ([x.strip() for x in args.readers.split(",") if x.strip()]
                if args.readers else None)
+    uncapped = _e3_uncapped(args)
     if args.stage == "all":
         res = e3.run(corpus, models, args.out, h_specs=_e3_h_specs(args, corpus) or None,
                      kernel=kernel, n_rep=args.n_rep, n_boot=args.n_boot, seed=args.seed,
-                     fit_human=not args.no_human, readers=readers)
+                     fit_human=not args.no_human, readers=readers, uncapped=uncapped)
         _print({"g5_passed": res["g5"].passed,
                 "rates": [{k: r[k] for k in ("reader", "estimator", "reject_cluster_robust",
                                              "reject_naive_LR")}
@@ -363,7 +392,8 @@ def cmd_e3(args) -> int:
             out[nm] = {"rows": len(rows), "failed": sum(1 for r in rows if r["failed"])}
         _print({"stage": "replicates", "replicates": [reps.start, reps.stop], "readers": out})
     elif args.stage == "human":
-        human = e3.run_human(corpus, prep, models, args.out, kernel=kernel, seed=args.seed)
+        human = e3.run_human(corpus, prep, models, args.out, kernel=kernel, seed=args.seed,
+                             uncapped=uncapped)
         _print({"stage": "human", "fits": [{k: f[k] for k in ("estimator", "delta_hat",
                                                               "p_headline")}
                                            for f in human["fits"]]})
@@ -492,6 +522,50 @@ def cmd_confounds(args) -> int:
     return 0
 
 
+def cmd_prefix_probe(args) -> int:
+    """Rescore a probe of targets with the passage-initial prefix in place of the span."""
+    from lcsa.cache import ReferenceScorer
+    from lcsa.data.provo import load_provo
+    from lcsa.prefixprobe import run
+
+    _ensure_out(args.out)
+    provo = load_provo(args.provo_dir, require_eye=False)
+    keys = _read_keys(Path(args.targets))
+    words = json.loads(Path(args.candidates).read_text())
+    if len(keys) != len(words):
+        raise SystemExit(f"{args.targets} has {len(keys)} rows but {args.candidates} has "
+                         f"{len(words)} lists; both come from the build directory")
+    scorer = ReferenceScorer(args.model, dtype=args.dtype)
+    scorer.memory_preflight()
+    rec = run(provo, keys, words, scorer, args.out, sample=args.sample, seed=args.seed,
+              max_depth=args.max_depth)
+    _print(rec["summary"])
+    return 0
+
+
+def cmd_sub_cache(args) -> int:
+    """Enumerate every retention subset of the short-context targets."""
+    from lcsa.cache import ReferenceScorer
+    from lcsa.data.provo import load_provo
+    from lcsa.subsetcache import BRIDGING_TARGETS, run
+
+    _ensure_out(args.out)
+    provo = load_provo(args.provo_dir, require_eye=False)
+    keys = _read_keys(Path(args.targets))
+    words = json.loads(Path(args.candidates).read_text())
+    if len(keys) != len(words):
+        raise SystemExit(f"{args.targets} has {len(keys)} rows but {args.candidates} has "
+                         f"{len(words)} lists; both come from the build directory")
+    scorer = ReferenceScorer(args.model, dtype=args.dtype)
+    scorer.memory_preflight()
+    expect = BRIDGING_TARGETS if args.expect_targets is None else args.expect_targets
+    expect = None if expect is not None and expect < 0 else expect
+    rec = run(provo, keys, words, scorer, args.out, k_max=args.k_max,
+              max_depth=args.max_depth, expect_n=expect)
+    _print(rec["summary"])
+    return 0
+
+
 def cmd_reliability(args) -> int:
     from lcsa.data.provo import load_provo
     from lcsa.experiments.reliability_stage import run
@@ -533,6 +607,15 @@ def cmd_e5(args) -> int:
     from lcsa.experiments import e5_participants as e5
 
     _ensure_out(args.out)
+    # The raw cloze export is not part of the distributed Provo norms, so this
+    # leg can have no input at all; it reports itself as not run rather than
+    # failing the chain that follows it.
+    if not args.participants or not Path(args.participants).exists():
+        missing = (f"{args.participants} does not exist" if args.participants
+                   else "--participants was not given")
+        res = e5.not_run(args.out, f"per-participant cloze responses unavailable: {missing}")
+        _print(res)
+        return 0
     corpus = _load(args)
     models = _models(args.estimators)
     kernel = _kernel(args)
@@ -822,6 +905,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     e1 = sub.add_parser("e1", help="exactness, sensitivity, residual fractions")
     common(e1)
+    e1.add_argument("--prefix-probe", default=None, metavar="JSON",
+                    help="prefix_probe.json of `lcsa prefix-probe`; its summary is folded "
+                         "into e1_summary, which is where prediction 12 reads it")
+    e1.add_argument("--sub-caches", default=None, metavar="NPZ",
+                    help="sub_caches.npz of `lcsa sub-cache`; without it the bridging "
+                         "report has no all-subsets cache to run on and prediction 10 "
+                         "is not scored")
     e1.set_defaults(func=cmd_e1)
 
     def shard(sp, prefix, what):
@@ -855,6 +945,10 @@ def build_parser() -> argparse.ArgumentParser:
                     default="all")
     e3.add_argument("--readers", default=None,
                     help="comma list of readers to prepare or replicate, default all")
+    e3.add_argument("--uncapped-cache", default=None, metavar="NPZ",
+                    help="cache.npz of the same targets built with --max-depth above the "
+                         "longest passage prefix; the human fit is repeated on it for "
+                         "prediction 13")
     shard(e3, "rep", "null replicate")
     shard(e3, "boot", "contrast bootstrap replicate")
     e3.set_defaults(func=cmd_e3)
@@ -877,8 +971,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     e5 = sub.add_parser("e5", help="participant audit: per-reader half-lives and reliability")
     common(e5)
-    e5.add_argument("--participants", required=True,
-                    help="per-participant cloze responses (participant, text_id, word_number, response)")
+    e5.add_argument("--participants", default=None,
+                    help="per-participant cloze responses (participant, text_id, word_number, "
+                         "response); absent, the audit is written as not run")
     e5.add_argument("--targets", default="artifacts/build/targets.csv")
     e5.add_argument("--candidates", default="artifacts/build/candidates.json")
     e5.add_argument("--e3-out", default=None,
@@ -912,6 +1007,48 @@ def build_parser() -> argparse.ArgumentParser:
     cf.add_argument("--seed", type=int, default=0)
     cf.add_argument("--kernel", choices=["power", "linear"], default="power")
     cf.set_defaults(func=cmd_confounds)
+
+    # The two defaults repeat lcsa.prefixprobe.DEFAULT_SAMPLE and DEFAULT_SEED
+    # rather than importing them, because building the parser must not pull in
+    # pandas; test_prefix_probe asserts the two spellings agree.
+    pp = sub.add_parser("prefix-probe",
+                        help="rescore a probe of targets from the passage start (needs a GPU)")
+    pp.add_argument("--provo-dir", required=True)
+    pp.add_argument("--targets", default="artifacts/build/targets.csv")
+    pp.add_argument("--candidates", default="artifacts/build/candidates.json")
+    pp.add_argument("--model", default="Qwen/Qwen2.5-1.5B")
+    pp.add_argument("--dtype", default="float16")
+    pp.add_argument("--out", default="artifacts")
+    pp.add_argument("--sample", type=int, default=50,
+                    help="targets drawn for the probe")
+    pp.add_argument("--seed", type=int, default=0)
+    pp.add_argument("--max-depth", type=int, default=None,
+                    help="depth cap of the build being probed; default is the build's own")
+    pp.set_defaults(func=cmd_prefix_probe)
+
+    # --k-max repeats lcsa.subsetcache.K_MAX for the same reason the two above
+    # repeat the probe's defaults; test_subset_cache asserts the two agree.
+    sc = sub.add_parser("sub-cache",
+                        help="enumerate every retention subset of the short-context "
+                             "targets (needs a GPU)")
+    sc.add_argument("--provo-dir", required=True)
+    sc.add_argument("--targets", default="artifacts/build/targets.csv")
+    sc.add_argument("--candidates", default="artifacts/build/candidates.json")
+    sc.add_argument("--model", default="Qwen/Qwen2.5-1.5B")
+    sc.add_argument("--dtype", default="float16")
+    sc.add_argument("--out", default="artifacts/build",
+                    help="where sub_caches.npz is written; the build directory, beside "
+                         "the cache and the targets it is keyed against")
+    sc.add_argument("--k-max", type=int, default=8,
+                    help="enumerate only targets at or below this depth; the cost is "
+                         "2^K forward passes per target")
+    sc.add_argument("--max-depth", type=int, default=None,
+                    help="depth cap of the build being enumerated; default is the build's own")
+    sc.add_argument("--expect-targets", type=int, default=None,
+                    help="number of short-context targets the selection must match; the "
+                         "default is the registered count, and -1 enumerates whatever "
+                         "the cap admits")
+    sc.set_defaults(func=cmd_sub_cache)
 
     rl = sub.add_parser("reliability", help="G3: debiased split-half JS and gaze reliability")
     rl.add_argument("--cache", default="artifacts/build/cache.npz")

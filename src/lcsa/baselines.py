@@ -24,7 +24,8 @@ from lcsa.fitting import fit
 from lcsa.kernels import POWER
 from lcsa.likelihood import Model, loglik
 
-__all__ = ["SlopeStat", "context_slopes", "auc", "hard_window_corpus",
+__all__ = ["SlopeStat", "context_slopes", "passage_slopes", "auc",
+           "decorativeness_check", "hard_window_corpus",
            "WindowFit", "hard_window_sweep", "sweep_disagreement"]
 
 
@@ -101,6 +102,24 @@ def context_slopes(corpus: Corpus) -> dict:
     }
 
 
+def passage_slopes(corpus: Corpus) -> dict:
+    """``context_slopes`` one passage at a time: both slopes per cluster.
+
+    The decorativeness rule grades a score by how well it separates two readers,
+    and a separation needs one value per independent unit, so the corpus-wide
+    slopes above are refitted inside each passage.  A passage whose targets
+    share one context length has no slope and carries ``nan``, which ``auc``
+    drops rather than counts.
+    """
+    entropy, top1 = [], []
+    for c in range(corpus.n_clusters):
+        one = context_slopes(corpus.subset_clusters([c]))
+        entropy.append(one["entropy"].slope)
+        top1.append(one["top1"].slope)
+    return {"entropy": np.asarray(entropy, dtype=np.float64),
+            "top1": np.asarray(top1, dtype=np.float64)}
+
+
 def auc(a, b) -> float:
     """Rank-based separation of two score samples, ties counted as half.
 
@@ -128,6 +147,46 @@ def auc(a, b) -> float:
         i = j + 1
     ra = ranks[: a.size].sum()
     return float((ra - a.size * (a.size + 1) / 2.0) / (a.size * b.size))
+
+
+def decorativeness_check(
+    entropy_human,
+    entropy_null,
+    top1_human,
+    top1_null,
+    stat_human,
+    stat_null,
+    margin: float = 0.05,
+) -> dict:
+    """The pre-committed falsifier: is the likelihood machinery decorative?
+
+    Each of the three scores is graded by the AUC with which its per-passage
+    values tell the human reader from a zero-decay null, oriented so that a
+    score separating the two readers perfectly reads 1.0 whichever of them it
+    ranks higher.  If either model-free slope lands within ``margin`` of the
+    cluster-robust statistic's AUC, the statistic is buying no separation the
+    response counts already gave, and the paper is committed to saying so.  A
+    gap that cannot be computed is not a verdict, so a ``nan`` never fires the
+    rule.
+    """
+    def graded(h, n) -> float:
+        a = auc(h, n)
+        return float(max(a, 1.0 - a)) if np.isfinite(a) else float("nan")
+
+    a_entropy = graded(entropy_human, entropy_null)
+    a_top1 = graded(top1_human, top1_null)
+    a_stat = graded(stat_human, stat_null)
+    gap_entropy = float(abs(a_stat - a_entropy))
+    gap_top1 = float(abs(a_stat - a_top1))
+    return {
+        "auc_entropy_slope": a_entropy,
+        "auc_top1_slope": a_top1,
+        "auc_cluster_robust": a_stat,
+        "gap_entropy_slope": gap_entropy,
+        "gap_top1_slope": gap_top1,
+        "margin": float(margin),
+        "decorative": bool(gap_entropy <= margin or gap_top1 <= margin),
+    }
 
 
 def hard_window_corpus(corpus: Corpus, window: int) -> Corpus:

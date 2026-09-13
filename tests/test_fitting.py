@@ -9,6 +9,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from conftest import draw, make_corpus
 from lcsa.fitting import _DELTA_MAX, fit, local_grid, profile_interval
 from lcsa.kernels import LINEAR
 from lcsa.likelihood import NAIVE, loglik_and_grad
@@ -44,6 +45,25 @@ def test_at_bound_is_false_when_delta_is_pinned(fitted_corpus):
     """A pinned delta is not an estimate, so it cannot be an estimate at a bound."""
     f = fit(fitted_corpus, NAIVE, fixed={0: 0.0}, n_starts=1, seed=0)
     assert not f.at_bound
+
+
+def test_a_nuisance_resting_on_its_box_is_reported(fitted_corpus, null_corpus):
+    """Responses drawn from the unigram alone push ``lam`` onto its upper bound.
+
+    Proposition 2 and Remark 1 both read the nuisance score sums as zero at the
+    constrained maximum, which a coordinate sitting on its box breaks, and this
+    reader shows what that costs, since a fit with no decay in it at all still
+    returns a positive delta.  Both ordinary fixtures land in the interior, so
+    the flag is not merely always true.
+    """
+    corp = draw(make_corpus(n_targets=80, n_clusters=10, seed=4),
+                np.array([0.0, 1.0 - 1e-6, 1.0]), NAIVE, n_per_target=200, seed=5)
+    f = fit(corp, NAIVE, n_starts=3, seed=0)
+    assert f.nuisance_at_bound
+    assert not f.at_bound
+    assert f.delta > 0.05
+    assert not fit(fitted_corpus, NAIVE, n_starts=3, seed=0).nuisance_at_bound
+    assert not fit(null_corpus, NAIVE, n_starts=3, seed=0).nuisance_at_bound
 
 
 def test_local_grid_is_clipped_to_the_parameter_box():

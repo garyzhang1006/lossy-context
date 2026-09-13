@@ -185,12 +185,18 @@ def build_corpus(
         for r in provo.words.itertuples()
         if getattr(r, "is_content", 0.0) == 1.0
     }
+    # An is_content the loader could recover from neither arm leaves this set
+    # empty, which makes the third lexical feature identically zero and drops
+    # the repaired nuisance dimension without anything downstream noticing.
+    if not content_words:
+        log.warning("no target is marked as a content word, so the is_content "
+                    "feature is constant and the repaired fit loses a dimension")
 
     resp = provo.responses
     grouped = {k: g for k, g in resp.groupby(["text_id", "word_number"])}
 
-    P_list, n_list, u_list, f_list, g_list, clusters, wid, slots = (
-        [], [], [], [], [], [], [], []
+    P_list, n_list, u_list, f_list, g_list, clusters, wid, slots, nctx, tkeys = (
+        [], [], [], [], [], [], [], [], [], []
     )
     rows = provo.words.itertuples()
     n_done = 0
@@ -252,6 +258,13 @@ def build_corpus(
         clusters.append(int(r.text_id))
         wid.append(np.arange(len(words)))
         slots.append(index.get(canonical_word(str(r.word)), -1))
+        # Kept beside K so a later reader can see which targets the cap actually
+        # cut: prediction 13 needs an arm where it cut none of them.
+        nctx.append(int(n_context))
+        # The same pair `keep_keys` hands back and `targets.csv` lists, carried
+        # on the corpus as well so an artifact built beside the cache can be
+        # resolved against it without the csv being at hand.
+        tkeys.append([int(r.text_id), int(r.word_number)])
         if keep_words is not None:
             keep_words.append(list(words))
         if keep_keys is not None:
@@ -269,7 +282,8 @@ def build_corpus(
             "indexed by word_number and that the response file matches them"
         )
     return Corpus(
-        P_list, n_list, u_list, f_list, g_list, clusters, wid, FEATURE_NAMES, slots
+        P_list, n_list, u_list, f_list, g_list, clusters, wid, FEATURE_NAMES, slots,
+        n_context=nctx, max_depth=cfg.max_depth, keys=tkeys
     )
 
 

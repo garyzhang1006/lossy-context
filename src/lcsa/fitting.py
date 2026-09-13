@@ -5,7 +5,8 @@ from ``Model.bounds`` and multiple starts.  Two behaviours matter for the
 paper's honesty and are implemented deliberately rather than incidentally.
 
 First, a fit that lands on either end of the ``delta`` box is reported as *at
-bound* rather than silently as a point estimate, because a boundary fit is the
+bound*, and one that rests a nuisance on its own box is reported as
+``nuisance_at_bound``, rather than silently as a point estimate, because a boundary fit is the
 visible form of an unidentified direction and dropping it would bias the
 bootstrap toward the paper's own prediction.
 
@@ -47,6 +48,12 @@ class FitResult:
     interval mean nothing, and both are reported rather than passed off as
     interior estimates.  It is ``False`` whenever ``delta`` was pinned by
     ``fixed``, since a pinned value is an input and not an estimate.
+
+    ``nuisance_at_bound`` is the same check applied to every *other* free
+    coordinate.  Proposition 2 and Remark 1 both assume the nuisance score sums
+    vanish at the constrained maximum, which is true only when those
+    coordinates sit in the interior, so a fit that rests a temperature or a
+    lexical coefficient on its box has broken the premise and says so.
     """
 
     theta: np.ndarray
@@ -57,6 +64,7 @@ class FitResult:
     at_bound: bool
     model_name: str
     param_names: list[str] = field(default_factory=list)
+    nuisance_at_bound: bool = False
 
     @property
     def delta(self) -> float:
@@ -68,6 +76,7 @@ class FitResult:
             loglik=self.loglik,
             success=self.success,
             at_bound=self.at_bound,
+            nuisance_at_bound=self.nuisance_at_bound,
             model=self.model_name,
         )
         return d
@@ -193,6 +202,12 @@ def fit(
     at_bound = (0 not in fixed) and (
         theta[0] >= delta_max - _BOUND_TOL or theta[0] <= _BOUND_TOL
     )
+    nuisance_at_bound = any(
+        theta[i] <= bounds_all[i][0] + _BOUND_TOL
+        or theta[i] >= bounds_all[i][1] - _BOUND_TOL
+        for i in free_idx
+        if i != 0
+    )
     return FitResult(
         theta=theta,
         loglik=L,
@@ -202,6 +217,7 @@ def fit(
         at_bound=at_bound,
         model_name=model.name,
         param_names=model.param_names(M, corpus.feature_names),
+        nuisance_at_bound=bool(nuisance_at_bound),
     )
 
 

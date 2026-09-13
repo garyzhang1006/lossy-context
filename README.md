@@ -181,7 +181,7 @@ is `lcsa e3 --cache GPT2_SMALL_CACHE --nulls none --readers N0 --no-human`.
 the Provo passages with a Min-K% score per passage, and `g1.json`, the
 sustained TFLOP/s of the build priced at 2N FLOP per parameter per token
 forwarded plus a ten percent attention surcharge, against the registered
-2.0 threshold. `lcsa confounds --reference gpt2=DIR ...` fits the human
+2.5 threshold. `lcsa confounds --reference gpt2=DIR ...` fits the human
 counts under each reference cache and prints that perplexity beside every
 delta, labelled as a competence confound rather than a null, and refits the
 human counts within tertiles of the primary reference's Min-K% score as the

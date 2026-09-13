@@ -6,13 +6,15 @@ drivers, all at a size that runs in about half a minute.
 
 from __future__ import annotations
 
+import csv
 import json
 
 import numpy as np
 import pytest
 from conftest import draw_true_delta, make_corpus
 
-from lcsa.baselines import auc, context_slopes, hard_window_sweep
+from lcsa.baselines import (auc, context_slopes, decorativeness_check,
+                           hard_window_sweep, passage_slopes)
 from lcsa.experiments.e1_exactness import exactness_report, run as run_e1
 from lcsa.experiments.e2_ladder import run as run_e2
 from lcsa.experiments.e3_nulls import h_lexical, run as run_e3
@@ -120,6 +122,17 @@ def test_corpus_round_trips_through_disk(data, tmp_path):
         loglik(data, np.array([0.3, 0.1, 0.9]), NAIVE), rel=1e-4)
 
 
+def test_a_cache_with_no_build_record_round_trips_as_unattested(data, tmp_path):
+    """Every cache already on disk predates the build record, so its absence is a
+    state the loader carries rather than a file it refuses."""
+    p = tmp_path / "cache.npz"
+    save_corpus(p, data)
+    with np.load(p, allow_pickle=False) as z:
+        assert "max_depth" not in z.files and "n_context" not in z.files
+    back = load_corpus(p)
+    assert back.max_depth is None and back.n_context is None
+
+
 def test_saved_cache_holds_no_pickled_objects(data, tmp_path):
     p = tmp_path / "cache.npz"
     save_corpus(p, data)
@@ -162,6 +175,36 @@ def test_auc_is_half_for_identical_samples_and_one_for_separated_ones():
     x = rng.normal(size=200)
     assert auc(x, x.copy()) == pytest.approx(0.5, abs=1e-9)
     assert auc(x + 50, x) == pytest.approx(1.0)
+
+
+def test_passage_slopes_give_one_value_per_passage(data):
+    per = passage_slopes(data)
+    for key in ("entropy", "top1"):
+        assert per[key].shape == (data.n_clusters,)
+        assert np.isfinite(per[key]).all()
+
+
+def test_the_decorative_rule_fires_when_a_slope_matches_the_statistic():
+    """Separating the readers as well as the statistic does makes it decorative."""
+    rng = np.random.default_rng(7)
+    human, null = rng.normal(1.0, 0.3, size=55), rng.normal(0.0, 0.3, size=55)
+    rep = decorativeness_check(human, null, rng.normal(size=55), rng.normal(size=55),
+                               human.copy(), null.copy())
+    assert rep["auc_entropy_slope"] == pytest.approx(rep["auc_cluster_robust"])
+    assert rep["gap_entropy_slope"] == pytest.approx(0.0)
+    assert rep["margin"] == 0.05 and rep["decorative"] is True
+
+
+def test_the_decorative_rule_clears_a_statistic_the_slopes_cannot_match():
+    """Slopes that tell the readers apart no better than chance leave it standing."""
+    rng = np.random.default_rng(8)
+    human, null = rng.normal(size=55), rng.normal(size=55)
+    rep = decorativeness_check(rng.normal(size=55), rng.normal(size=55),
+                               rng.normal(size=55), rng.normal(size=55),
+                               human + 50.0, human)
+    assert rep["auc_cluster_robust"] == pytest.approx(1.0)
+    assert rep["gap_entropy_slope"] > 0.05 and rep["gap_top1_slope"] > 0.05
+    assert rep["decorative"] is False
 
 
 def test_hard_window_sweep_recovers_the_generating_window():
@@ -208,6 +251,7 @@ def test_experiment_drivers_run_and_write_artifacts(tmp_path, delta):
                 n_boot=5, n_folds=4, use_mixed=False, seed=0)
     assert r4["selected"]["primary"] in (0, 2, 4, 8)
     assert (out / "e4" / "e4_sweep_curves.csv").exists()
+    assert isinstance(r4["decorativeness"]["decorative"], bool)
 
 
 def test_artifacts_are_valid_json(tmp_path):
@@ -224,6 +268,29 @@ def test_cli_selftest_passes(tmp_path):
 
     assert main(["selftest", "--out", str(tmp_path / "st"), "--n-rep", "3",
                  "--n-boot", "6"]) == 0
+
+
+def test_the_selftest_residual_fractions_match_the_published_remark(tmp_path):
+    """Guard the four numbers Remark 1 of the paper quotes from this command.
+
+    The remark's point is that the global fraction is pinned near one for any
+    reader while the per-target fraction is not, so a change that moves either
+    column changes a published claim and should fail here first.  The registered
+    smoothing is alpha = 0.5 and the fractions do not depend on --n-rep.
+    """
+    from lcsa.cli import main
+
+    out = tmp_path / "st"
+    assert main(["selftest", "--out", str(out), "--n-rep", "3",
+                 "--n-boot", "6"]) == 0
+    with (out / "e1" / "e1_residual_fraction.csv").open() as f:
+        rows = {r["estimator"]: r for r in csv.DictReader(f)
+                if float(r["jeffreys_alpha"]) == 0.5}
+    assert int(rows["naive"]["n_targets"]) == 120
+    assert float(rows["naive"]["residual_fraction_global"]) == pytest.approx(0.99998, abs=5e-5)
+    assert float(rows["repaired"]["residual_fraction_global"]) == pytest.approx(0.99957, abs=5e-5)
+    assert float(rows["naive"]["residual_fraction_per_target"]) == pytest.approx(0.914, abs=5e-4)
+    assert float(rows["repaired"]["residual_fraction_per_target"]) == pytest.approx(0.555, abs=5e-4)
 
 
 def test_cli_reports_a_missing_cache_clearly(tmp_path):

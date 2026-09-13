@@ -191,7 +191,7 @@ def test_cli_stages_and_merge_reproduce_the_monolithic_commands(corpus, tmp_path
                  "--readers", "N0", "N0-PRIME", "N-LEX"]) == 0
     assert main(["merge", "--out", sh, "--legs", "e2,e3"]) == 0
     card = json.loads((Path(sh) / "scorecard.json").read_text())
-    assert {r["id"] for r in card["predictions"]} == set(range(1, 12))
+    assert {r["id"] for r in card["predictions"]} == set(range(1, 14))
     assert card["registration_sha256"] == (Path(sh) / "registration.sha256").read_text().split()[0]
     _same(tmp_path / "mono", tmp_path / "sh",
           ["e2_summary.json", "e2_coverage.csv", "e3_summary.json",

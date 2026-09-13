@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # E1: exactness identities, sensitivity and residual fractions on the cache.
 #
-#   sbatch --dependency=afterok:<lcsa-build id> slurm/e1.sbatch
+#   sbatch --dependency=afterok:<lcsa-sub-cache id> slurm/e1.sbatch
+#
+# The dependency is the subset-cache job and not the build, because the
+# bridging report of prediction 10 reads sub_caches.npz and that job is the
+# only thing that writes it; the subset job itself waits on the build.
 #SBATCH --job-name=lcsa-e1
 #SBATCH --partition=scu-cpu
 #SBATCH --cpus-per-task=4
@@ -14,4 +18,6 @@ ENV="${LCSA_REPO:-$SLURM_SUBMIT_DIR}/slurm/env.sh"
 . "$ENV"
 CACHE="$LCSA_ROOT/build/cache.npz"
 [ -f "$CACHE" ] || { echo "no cache at $CACHE; run slurm/build.sbatch first" >&2; exit 1; }
-lcsa e1 --kernel "$LCSA_KERNEL" --cache "$CACHE" --out "$LCSA_ART"
+SUB="$LCSA_ROOT/build/sub_caches.npz"
+[ -f "$SUB" ] || { echo "no subset caches at $SUB; run slurm/sub_cache.sbatch first" >&2; exit 1; }
+lcsa e1 --kernel "$LCSA_KERNEL" --cache "$CACHE" --out "$LCSA_ART" --sub-caches "$SUB"

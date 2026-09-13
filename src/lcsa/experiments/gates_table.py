@@ -53,7 +53,7 @@ def collect(out_dir, build_dir=None, gpu_hours: float | None = None,
         g0 = {"passed": all(bool(f) for f in flags), "measured": measured,
               "threshold": (g0_data or {}).get("threshold", "")}
     if g1 is not None:
-        g1 = {"passed": g1.get("passed"), "threshold": f">= {g1.get('threshold', 2.0)} TFLOP/s",
+        g1 = {"passed": g1.get("passed"), "threshold": f">= {g1.get('threshold', 2.5)} TFLOP/s",
               "measured": {"tflops": g1.get("tflops"), "tokens_forwarded": g1.get("tokens_forwarded")}}
     human = e3.get("human") or {}
     rows = [

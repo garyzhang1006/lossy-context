@@ -21,10 +21,11 @@ scale only.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -74,6 +75,7 @@ _EYE_ALIASES = {
     ],
     "first_fixation": ["ia_first_fixation_duration", "first_fixation_duration"],
     "word_length": ["word_length", "ia_length"],
+    "word_content_or_function": ["word_content_or_function"],
 }
 
 
@@ -92,6 +94,73 @@ def _compare_key(w: str) -> str:
     """
     s = unicodedata.normalize("NFKD", canonical_word(w)).encode("ascii", "ignore").decode("ascii")
     return re.sub(r"[^a-z0-9]", "", s)
+
+
+def _merge_run(seq: list[tuple[int, str]], start: int, target: str) -> int:
+    """How many tokens from ``start`` join to spell ``target`` exactly, else 0.
+
+    A run of one is not a merge, so it returns 0 and the caller keeps looking.
+    """
+    merged, k = "", start
+    while k < len(seq) and k - start < 4:
+        if not seq[k][1]:
+            return 0
+        cand = merged + seq[k][1]
+        if not target.startswith(cand):
+            return 0
+        merged, k = cand, k + 1
+        if merged == target:
+            return k - start if k - start >= 2 else 0
+    return 0
+
+
+def _align_arm(norms: list[tuple[int, str]],
+               eye: list[tuple[int, str]]) -> tuple[dict[int, int], int | None]:
+    """Map each eye ``word_number`` onto the norms number naming the same word.
+
+    The two Provo releases tokenise contractions differently.  The norms split
+    ``doesn't`` into two numbered words where the eye-tracking file keeps one,
+    and from that word on the eye numbering runs behind the norms numbering for
+    the rest of the passage, which is why a per-key comparison sees a wrong word
+    at every later number.  Walking the two lists together recovers those keys,
+    and the walk moves the numbering only where the split is provable, since it
+    accepts several norms tokens as one eye token when their letters join to
+    spell it exactly.  A number missing from one arm is a coverage gap and moves
+    nothing.  Anything else stops the walk and the caller quarantines the rest of
+    the passage, so an eye file that simply numbers its passages differently is
+    still refused rather than re-joined onto its neighbours' reading times.
+
+    Returns the mapping and the eye ``word_number`` where the walk stopped,
+    which is ``None`` when the passage aligned to its end.
+    """
+    out: dict[int, int] = {}
+    i = j = off = 0
+    while i < len(norms) and j < len(eye):
+        nwn, nk = norms[i]
+        ewn, ek = eye[j]
+        if nwn < ewn + off:      # a target no eye row names
+            i += 1
+            continue
+        if nwn > ewn + off:      # an eye row no target names
+            j += 1
+            continue
+        if nk == ek or not nk or not ek:
+            out[ewn] = nwn
+            i, j = i + 1, j + 1
+            continue
+        m = _merge_run(norms, i, ek)
+        if m:                    # the norms split one eye token
+            out[ewn] = nwn
+            off += m - 1
+            i, j = i + m, j + 1
+            continue
+        m = _merge_run(eye, j, nk)
+        if m:                    # the eye file split one target; no whole-word time
+            off -= m - 1
+            i, j = i + 1, j + m
+            continue
+        return out, ewn
+    return out, None
 
 
 def read_provo_csv(path: str | Path) -> tuple[pd.DataFrame, str]:
@@ -140,6 +209,15 @@ def _resolve(df: pd.DataFrame, aliases: dict[str, list[str]], required: set[str]
     return out
 
 
+def _digest(path: Path) -> str:
+    """sha256 of one source file, read in chunks so a large release costs no memory."""
+    h = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 @dataclass
 class ProvoData:
     """Reconciled Provo arms plus the passage word lists."""
@@ -153,6 +231,9 @@ class ProvoData:
     # Keys the eye-tracking file numbers differently from the norms, found by
     # comparing its word column; None when that file carries no word column.
     arm_word_mismatches: int | None = None
+    # sha256 of each source file this record was read from, keyed by file name,
+    # so a gate can record which release produced the counts it audits.
+    source_sha256: dict[str, str] = field(default_factory=dict)
 
     @property
     def n_passages(self) -> int:
@@ -180,6 +261,7 @@ class ProvoData:
             "intersection": self.intersection_size,
             "arm_word_mismatches": self.arm_word_mismatches,
             "encoding": self.encoding,
+            "source_sha256": dict(self.source_sha256),
         }
 
 
@@ -192,6 +274,8 @@ def load_provo(
     """Load and reconcile the two Provo arms."""
     d = Path(provo_dir)
     norms, enc = read_provo_csv(d / norms_name)
+    # After the read, so a missing file still raises the loader's own message.
+    digests = {norms_name: _digest(d / norms_name)}
     cols = _resolve(
         norms,
         _NORM_ALIASES,
@@ -270,6 +354,7 @@ def load_provo(
     arm_mism = None
     eye_path = d / eye_name
     if eye_path.exists():
+        digests[eye_name] = _digest(eye_path)
         eye, _ = read_provo_csv(eye_path)
         ec = _resolve(eye, _EYE_ALIASES, {"text_id", "word_number", "gaze"},
                       "the eye-tracking file")
@@ -287,43 +372,103 @@ def load_provo(
         )
         if "word" in ec:
             gaze["word"] = eye[ec["word"]].fillna("").astype(str)
+        if "word_content_or_function" in ec:
+            gaze["content"] = (
+                eye[ec["word_content_or_function"]].astype(str).str.lower().str[:7]
+                == "content"
+            ).astype(float)
         gaze = gaze.dropna(subset=["text_id", "word_number", "gaze"])
         gaze["text_id"] = gaze["text_id"].astype(int)
         gaze["word_number"] = gaze["word_number"].astype(int)
         gaze = gaze[gaze["gaze"] > 0]
         # The two arms are joined on (text_id, word_number) alone, and nothing
         # downstream would notice if the eye-tracking file numbered a passage
-        # differently: E4 would regress gaze on the surprisal of a neighbouring
-        # word.  Where the file names the word, the first key in a passage
-        # whose word disagrees with the norms starts a quarantine that runs to
-        # the end of that passage's gaze arm, because a shift in the numbering
-        # cannot heal itself and a key where the shifted word happens to
-        # coincide ("had had", a repeated "the") would otherwise survive with a
-        # neighbour's reading time attached.  The comparison folds accents and
-        # punctuation away because the two files need not decode under the
-        # same encoding, and a key either file cannot name is not evidence.
+        # differently, since E4 would regress gaze on the surprisal of a
+        # neighbouring word.  Where the file names the word, each passage is
+        # walked against the norms word by word, which both detects a shift and
+        # repairs the one shift the two Provo releases actually carry, a
+        # contraction the norms split into two numbered words and the
+        # eye-tracking file kept as one.  Only a provable split moves a number,
+        # so a passage numbered differently for any other reason is quarantined
+        # from the first word that will not align to the end of its gaze arm,
+        # because a key where the shifted word happens to coincide ("had had",
+        # a repeated "the") would otherwise survive with a neighbour's reading
+        # time attached.  The comparison folds accents and punctuation away
+        # because the two files need not decode under the same encoding, and a
+        # key either file cannot name is not evidence.
         if "word" in gaze.columns:
-            norm_word = {(int(t), int(k)): _compare_key(x)
-                         for t, k, x in zip(w["text_id"], w["word_number"], w["word"])}
+            norm_seq: dict[int, list[tuple[int, str]]] = {}
+            for t, k, x in zip(w["text_id"], w["word_number"], w["word"]):
+                norm_seq.setdefault(int(t), []).append((int(k), _compare_key(x)))
+            norm_key = {(t, k) for t, s in norm_seq.items() for k, _ in s}
             eye_word = (gaze.groupby(["text_id", "word_number"])["word"]
                         .agg(lambda s: next((_compare_key(x) for x in s if _compare_key(x)), "")))
-            first_bad: dict[int, int] = {}
+            eye_seq: dict[int, list[tuple[int, str]]] = {}
             for (t, k), x in eye_word.items():
-                if x and norm_word.get((t, k)) and norm_word[(t, k)] != x:
-                    first_bad[t] = min(first_bad.get(t, k), k)
-            bad = {(t, k) for (t, k) in eye_word.index
-                   if t in first_bad and k >= first_bad[t] and (t, k) in norm_word}
+                eye_seq.setdefault(int(t), []).append((int(k), x))
+
+            remap: dict[tuple[int, int], int] = {}
+            bad: set[tuple[int, int]] = set()
+            stops: dict[int, int] = {}
+            drop: set[tuple[int, int]] = set()
+            shifted = 0
+            for t, seq in sorted(eye_seq.items()):
+                ref = sorted(norm_seq.get(t, []))
+                if not ref:
+                    continue
+                seq.sort()
+                amap, stop = _align_arm(ref, seq)
+                moved = 0
+                for ewn, nwn in amap.items():
+                    remap[(t, ewn)] = nwn
+                    moved += nwn != ewn
+                shifted += moved
+                if stop is not None:
+                    stops[t] = stop
+                    bad |= {(t, k) for k, _ in seq if k >= stop and (t, k) in norm_key}
+                # Once a passage is renumbered, a key the walk never paired has
+                # to go with it: that key names a word the norms do not, or half
+                # of one the eye file split, so keeping its own number would put
+                # a neighbour's reading time on a target.  A passage that moved
+                # nothing keeps every key it had.
+                if moved:
+                    drop |= {(t, k) for k, _ in seq if k not in amap}
+            drop |= bad
             arm_mism = len(bad)
+            if shifted:
+                log.info(
+                    "%d eye-tracking keys were renumbered onto the norms numbering, "
+                    "which the two releases split differently at contractions", shifted,
+                )
             if bad:
                 log.warning(
-                    "%d passages carry a different word in the eye-tracking file "
-                    "than in the norms from some word on (first disagreement at %s); "
-                    "%d (text_id, word_number) keys are dropped from the gaze arm "
-                    "from that word to the end of the passage",
-                    len(first_bad), sorted(first_bad.items())[:5], arm_mism,
+                    "%d passages carry words the eye-tracking file and the norms "
+                    "cannot align (first at %s); %d (text_id, word_number) keys are "
+                    "dropped from the gaze arm from that word to the end of the passage",
+                    len(stops), sorted(stops.items())[:5], arm_mism,
                 )
-                keys = list(zip(gaze["text_id"], gaze["word_number"]))
-                gaze = gaze[[k not in bad for k in keys]]
+            keys = list(zip(gaze["text_id"], gaze["word_number"]))
+            if drop:
+                keep = [k not in drop for k in keys]
+                gaze = gaze[keep]
+                keys = [k for k, ok in zip(keys, keep) if ok]
+            if shifted:
+                gaze = gaze.assign(word_number=[remap.get(k, k[1]) for k in keys])
+            # The 2018 norms release does not always carry the content/function
+            # column the eye-tracking release does, and without it every target
+            # reads as a function word, which silently zeroes one of the four
+            # lexical features the repaired estimator fits.
+            if "content" in gaze.columns:
+                if w["is_content"].isna().all() and gaze["content"].notna().any():
+                    flag = (gaze.dropna(subset=["content"])
+                            .groupby(["text_id", "word_number"])["content"].first())
+                    w = w.assign(is_content=[
+                        flag.get((int(t), int(k)), np.nan)
+                        for t, k in zip(w["text_id"], w["word_number"])
+                    ])
+                    log.info("is_content was recovered for %d of %d targets from %s",
+                             int(w["is_content"].notna().sum()), len(w), eye_name)
+                gaze = gaze.drop(columns=["content"])
             gaze = gaze.drop(columns=["word"])
     elif require_eye:
         raise FileNotFoundError(f"{eye_path} not found and require_eye=True")
@@ -350,6 +495,7 @@ def load_provo(
         intersection_size=len(inter),
         encoding=enc,
         arm_word_mismatches=arm_mism,
+        source_sha256=digests,
     )
 
 

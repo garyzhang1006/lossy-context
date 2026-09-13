@@ -385,8 +385,15 @@ def _split_counts(n: np.ndarray, rng: np.random.Generator) -> tuple[np.ndarray, 
 
     Half of the responses of every target go to arm A, chosen uniformly among
     the responses, so the two arms are exchangeable and their sampling noise is
-    independent given the total; that independence is what makes the cross
-    inner product unbiased for the signal norm.
+    uncorrelated to leading order, which is what removes the leading noise term
+    from the cross inner product.  The split is without replacement at a fixed
+    total, so the two arms are weakly negatively dependent and an O(1/N) term
+    survives at N near 40, and the log transform of a smoothed proportion is
+    nonlinear, so the cross inner product estimates the squared mean residual
+    at half sample size rather than at the full one.  Both residues inflate the
+    cross products slightly, so the debiased fraction is a corrected quantity
+    rather than an unbiased one, and Table tab:alpha carries it at three
+    smoothing values for that reason.
     """
     n = np.asarray(np.round(n), dtype=np.int64)
     total = int(n.sum())
@@ -456,6 +463,11 @@ def split_half_residual(
     # A non-positive debiased total means the mismatch is indistinguishable
     # from sampling noise; the fraction is then undefined and reported as nan
     # with the signal-to-noise ratio beside it so that the reader can see why.
+    # A negative perpendicular numerator against a positive total is the same
+    # statement about the orthogonal part alone, and it is clipped to zero, so
+    # a fraction reported as exactly 0.0 means "no measurable signal outside
+    # the span" rather than "measured at zero"; n_negative_splits counts the
+    # splits in which either quantity went non-positive.
     frac = float(np.sqrt(max(perp, 0.0) / tot)) if tot > 0 else float("nan")
     raw = sum(N * float(x @ x) for x, _, _, N in base)
     return {
@@ -547,9 +559,12 @@ def lambda_curvature_leak(
     is the exception: ``log ptil`` is concave in ``lambda`` and a tilt of size
     ``a`` along ``s_lambda`` leaves a second-order remainder ``(a^2/2)
     c_lambda`` with ``c_lambda = -beta (u - p_delta)^2 / ptil^2``.  The bias
-    it leaks into ``delta`` is ``(a^2/2) <c_lambda, psi_eff>_N / I_eff``,
+    it leaks into ``delta`` is ``-(a^2/2) <c_lambda, psi_eff>_N / I_eff``,
     evaluated here at ``a`` equal to the observed mismatch's projection
-    coefficient on ``s_lambda`` unless ``a_lambda`` is given.
+    coefficient on ``s_lambda`` unless ``a_lambda`` is given.  The family
+    absorbs ``a s_lambda + (a^2/2) c_lambda`` exactly by moving lambda, so the
+    unabsorbed residual is ``-(a^2/2) c_lambda`` and the leading minus sign
+    belongs in the leak, not only in ``c_lambda`` itself.
     """
     M = corpus.M
     full = global_residual(corpus, theta, model, kernel, alpha)
@@ -571,7 +586,7 @@ def lambda_curvature_leak(
         bc += tgt.N * (X.T @ x)
     w = _solve_psd(G, I_pd)
     inner_eff = inner - float(w @ bc)
-    leak = 0.5 * a * a * inner_eff / full.info_eff if full.info_eff > 0 else float("nan")
+    leak = -0.5 * a * a * inner_eff / full.info_eff if full.info_eff > 0 else float("nan")
     return {
         "a_lambda": a,
         "curvature_inner_eff": float(inner_eff),

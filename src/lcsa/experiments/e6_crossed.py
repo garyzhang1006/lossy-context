@@ -112,7 +112,7 @@ def summarise_panel(rows: list[dict]) -> list[dict]:
             "median_log2_shift": float(np.median(shift)) if shift.size else float("nan"),
             "log2_shift_q25": float(np.percentile(shift, 25)) if shift.size else float("nan"),
             "log2_shift_q75": float(np.percentile(shift, 75)) if shift.size else float("nan"),
-            "share_shift_over_one_rung": float(np.mean(np.abs(shift) > 1.0)) if shift.size else float("nan"),
+            "share_shift_over_one_rung": float(np.mean(np.abs(shift) >= 1.0)) if shift.size else float("nan"),
             "coverage_plain": float(np.mean(cov_p)) if cov_p else float("nan"),
             "coverage_tilted": float(np.mean(cov_t)) if cov_t else float("nan"),
             "frac_unbounded_tilted": float(np.mean(unb_t)) if unb_t else float("nan"),

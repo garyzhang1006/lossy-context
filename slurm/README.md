@@ -92,7 +92,7 @@ implementation in the released code and whose frozen plan file was not in the
 repository. Here `register.sbatch` runs before the build and writes
 `$LCSA_ART/registration.json`, holding the design constants imported from the
 code (ladder rungs, coverage rungs, panel rungs, the residual-fraction split
-procedure, the replicate counts and the shard tiling), the eleven predictions
+procedure, the replicate counts and the shard tiling), the thirteen predictions
 with their thresholds, the reading rule and the pre-committed gate branches
 (G2 failing makes prediction 9 read the analytic ceiling, G4 failing scores
 prediction 6 as interval overlap, G5 failing voids predictions 2 to 11 and the
@@ -184,7 +184,8 @@ file with a different count instead of dropping the tail from the last shard.
 | `register.sbatch` | scu-cpu | 1 cpu, 2000M | 10 min | `lcsa register`: the frozen design, predictions and reading rule with their SHA-256 |
 | `build.sbatch` | scu-gpu | 1 L40S, 8 cpu, 48000M | 12 h | the memory preflight, a 20-target smoke build with a throughput extrapolation, then the full build at the registered settings |
 | `build_refs.sbatch` | scu-gpu | array of `LCSA_REFS`, 1 L40S, 8 cpu, 48000M | 12 h | GPT-2-large, GPT-2-small and Qwen2.5-0.5B caches on the primary's frozen candidate sets |
-| `e1.sbatch` | scu-cpu | 4 cpu, 16000M | 12 h | exactness, sensitivity, residual fractions |
+| `sub_cache.sbatch` | scu-gpu | 1 L40S, 8 cpu, 48000M | 12 h | the all-subsets cache of the targets at `K <= K_MAX`: every retention mask, not only the suffixes, which is what the bridging report of prediction 10 is scored from |
+| `e1.sbatch` | scu-cpu | 4 cpu, 16000M | 12 h | exactness, sensitivity, residual fractions, and the bridging report over `sub_caches.npz` |
 | `e2_ladder.sbatch` | scu-cpu | 4 cpu, 16000M | 12 h | the ladder generated under GPT-2-large and fitted under Qwen, plus `e2_theta0.json` |
 | `e2_cov.sbatch` | scu-cpu | array of `E2_SHARDS`, 4 cpu, 16000M | 12 h | coverage replicates at rungs 4, 8, 12, 16, 20, 24 and 32; the ceiling is read from these |
 | `e3_prepare.sbatch` | scu-gpu | 1 L40S, 8 cpu, 48000M | 12 h | the constrained fit, the N0-PRIME calibration and the lexical, topic and order tilts |

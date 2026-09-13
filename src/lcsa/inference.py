@@ -399,34 +399,47 @@ class TOSTResult:
     p: float
     equivalent: bool
     n_used: int
+    df: float = float("inf")
 
 
 def tost(
     differences: Sequence[float],
     margin: float = 0.25,
     alpha: float = 0.05,
+    df: float | None = None,
 ) -> TOSTResult:
     """Two one-sided tests for equivalence on a bootstrap difference distribution.
 
     ``differences`` are paired bootstrap replicates of ``log delta_human -
     log delta_null``.  Non-finite replicates (a boundary or unbounded fit on
     either side) are excluded from the moments and counted, since a log
-    difference is undefined there; the count is returned so that an equivalence
-    claim resting on few usable replicates is visible.
+    difference is undefined there, and the count is returned so that an
+    equivalence claim resting on few usable replicates is visible.
+
+    ``df`` sets the reference distribution.  The caller passes the cluster count
+    less one, which is the same degrees of freedom every other interval in the
+    paper carries, because a normal reference on 55 clusters makes equivalence
+    easier to declare and equivalence is the direction the registered
+    prediction wants.  Leaving it ``None`` keeps the normal reference.
     """
     d = np.asarray([x for x in differences if np.isfinite(x)], dtype=np.float64)
+    nu = float("inf") if df is None else float(df)
+    if nu <= 0.0:
+        raise ValueError(f"df must be positive, got {df!r}")
+    ref = norm if df is None else t_dist(nu)
     if d.size < 3:
-        return TOSTResult(margin, float("nan"), float("nan"), 1.0, 1.0, 1.0, False, int(d.size))
+        return TOSTResult(margin, float("nan"), float("nan"), 1.0, 1.0, 1.0, False,
+                          int(d.size), nu)
     m = float(d.mean())
     se = float(d.std(ddof=1))
     if se <= 0.0:
         eq = abs(m) < margin
         return TOSTResult(margin, m, 0.0, 0.0 if eq else 1.0, 0.0 if eq else 1.0,
-                          0.0 if eq else 1.0, eq, int(d.size))
-    p_lo = float(norm.sf((m + margin) / se))
-    p_hi = float(norm.cdf((m - margin) / se))
+                          0.0 if eq else 1.0, eq, int(d.size), nu)
+    p_lo = float(ref.sf((m + margin) / se))
+    p_hi = float(ref.cdf((m - margin) / se))
     p = max(p_lo, p_hi)
-    return TOSTResult(margin, m, se, p_lo, p_hi, p, p < alpha, int(d.size))
+    return TOSTResult(margin, m, se, p_lo, p_hi, p, p < alpha, int(d.size), nu)
 
 
 def rejection_rate(p_values: Sequence[float], alpha: float = 0.05) -> tuple[float, float, float]:

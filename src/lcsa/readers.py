@@ -47,6 +47,7 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "LADDER_DHALF",
+    "TARGET_TILT_RATIO",
     "ladder_deltas",
     "draw_counts",
     "reader_n0",
@@ -64,6 +65,16 @@ __all__ = [
 #: the registered window, 12, 20 and 24, are what let the identification
 #: ceiling be read as a rate rather than as the single largest bounded rung.
 LADDER_DHALF = (2.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 32.0, 64.0, 128.0, float("inf"))
+
+
+#: Scale of N0-prime's target-level tilt as a fraction of its passage-level one.
+#: The design calls the target-level component "smaller", and a fixed ratio is
+#: what lets the single bisection on ``sigma_passage`` still calibrate the
+#: design effect: the intraclass correlation it implies, 1/(1 + ratio**2), does
+#: not move with the scale, so the design effect stays monotone in it.  At 0.35
+#: the target-level component carries about an eighth of the tilt variance,
+#: enough to be participant variation and too little to be the floor's story.
+TARGET_TILT_RATIO = 0.35
 
 
 def ladder_deltas(kernel=POWER) -> list[float]:
@@ -108,7 +119,7 @@ def reader_n0_prime(
     theta0: np.ndarray,
     model: Model,
     sigma_passage: float,
-    sigma_target: float = 0.0,
+    sigma_target: float | None = None,
     seed: int = 0,
     kernel=POWER,
 ) -> Corpus:
@@ -120,9 +131,17 @@ def reader_n0_prime(
     counts cannot separate.  Both live in the nuisance span, so true decay stays
     exactly zero and the only thing that changes is the between-cluster variance
     of the score.
+
+    ``sigma_target`` defaults to ``TARGET_TILT_RATIO * sigma_passage``, that is
+    0.35 of the passage scale, so the two components move together and the
+    bisection in :func:`calibrate_n0_prime`, which searches on ``sigma_passage``
+    alone, still calibrates the whole design.  Pass a number to set it directly
+    or ``0.0`` to switch the target-level component off.
     """
     if float(theta0[0]) != 0.0:
         raise ValueError(f"the floor must be generated at delta=0, got delta={theta0[0]}")
+    if sigma_target is None:
+        sigma_target = TARGET_TILT_RATIO * float(sigma_passage)
     rng = np.random.default_rng(seed)
     M = corpus.M
     dim = model.dim(M) - 1
@@ -174,8 +193,8 @@ def calibrate_n0_prime(
     def deff(sig: float) -> float:
         vals = []
         for r in range(n_rep):
-            c = reader_n0_prime(corpus, theta0, model, sig, seed=seed + 1000 * r + 1,
-                                kernel=kernel)
+            c = reader_n0_prime(corpus, theta0, model, sigma_passage=sig,
+                                seed=seed + 1000 * r + 1, kernel=kernel)
             st = score_test(c, model, kernel, n_starts=1)
             if np.isfinite(st.design_effect):
                 vals.append(st.design_effect)

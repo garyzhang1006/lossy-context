@@ -86,6 +86,27 @@ def test_depth_is_the_number_of_preceding_words_capped_at_the_config(built):
         assert tgt.K == min(wn - 2, 4)
 
 
+def test_the_cache_carries_the_depth_cap_and_every_untruncated_context(built, tmp_path):
+    """Prediction 13's uncapped arm is a claim about the build, not about K.
+
+    Without these two fields a cache cut at 4 and a cache cut at 40 are told
+    apart only by which happens to be deeper, so a merely deeper arm scores the
+    prediction as if nothing had been truncated.
+    """
+    provo, corpus, _, keys = built
+    assert corpus.max_depth == 4
+    # The fixtures number from 2, so the words below the target number 2..wn-1.
+    assert corpus.n_context.tolist() == [wn - 2 for _, wn in keys]
+    depths = np.array([t.K for t in corpus])
+    assert (depths < corpus.n_context).any(), "no target was capped, so nothing is attested"
+
+    p = tmp_path / "cache.npz"
+    save_corpus(p, corpus)
+    back = load_corpus(p)
+    assert back.max_depth == corpus.max_depth
+    assert back.n_context.tolist() == corpus.n_context.tolist()
+
+
 def test_cache_rows_are_distributions_and_differ_across_depth(built):
     _, corpus, _, _ = built
     for tgt in corpus:

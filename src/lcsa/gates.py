@@ -46,7 +46,10 @@ class GateResult:
 def g0_data_integrity(raw_norms, provo, corpus=None) -> GateResult:
     """G0: the response file decoded cleanly and the join is on the right words.
 
-    Checks, in order: no U+FFFD replacement characters anywhere in the file, the
+    Checks, in order: no U+FFFD replacement characters anywhere in the file, no
+    C1 control character in U+0080 to U+009F, which is the failure a U+FFFD scan
+    misses because the latin-1 rung of the decoding ladder maps every byte to a
+    code point and turns a cp1252 smart quote into U+0092 silently, the
     literal response ``"NA"`` survived, empty responses are counted rather than
     silently dropped, and every norms row finds its own word at its
     ``Word_Number`` in the passage list, which is the index every context
@@ -63,6 +66,11 @@ def g0_data_integrity(raw_norms, provo, corpus=None) -> GateResult:
     text_cols = [c for c in raw_norms.columns if raw_norms[c].dtype == object]
     fffd = int(
         sum(int(raw_norms[c].astype(str).str.contains("�", regex=False).sum())
+            for c in text_cols)
+    )
+    c1 = int(
+        sum(int(raw_norms[c].astype(str)
+                .str.contains(r"[\u0080-\u009f]", regex=True, na=False).sum())
             for c in text_cols)
     )
     resp_col = next((c for c in raw_norms.columns if c.lower() == "response"), None)
@@ -97,6 +105,7 @@ def g0_data_integrity(raw_norms, provo, corpus=None) -> GateResult:
     )
     measured = {
         "replacement_chars": fffd,
+        "c1_control_chars": c1,
         "literal_NA_responses": literal_na,
         "empty_responses": empty_resp,
         "join_mismatches": mism,
@@ -105,6 +114,10 @@ def g0_data_integrity(raw_norms, provo, corpus=None) -> GateResult:
         "frac_targets_ge_25_responses": frac25,
         "mean_responses": float(counts.mean()) if counts.size else float("nan"),
         "mean_response_types": float(types.mean()) if types.size else float("nan"),
+        # Which release these counts came from.  The gate asserts nothing about
+        # the digest, since the expected value is whatever release the run used;
+        # it records it so the scorecard says what was audited.
+        "provo_source_sha256": dict(getattr(provo, "source_sha256", {}) or {}),
     }
     if corpus is not None:
         rows_bad = 0
@@ -113,18 +126,19 @@ def g0_data_integrity(raw_norms, provo, corpus=None) -> GateResult:
             if np.abs(P.sum(axis=1) - 1.0).max() > 1e-6:
                 rows_bad += 1
         measured["cache_rows_not_normalised"] = rows_bad
-    passed = (fffd == 0 and mism == 0 and arm_frac <= 0.10
+    passed = (fffd == 0 and c1 == 0 and mism == 0 and arm_frac <= 0.10
               and (frac25 > 0.95 or not np.isfinite(frac25)))
     return GateResult(
         "G0", passed, measured,
-        "zero replacement characters, zero join mismatches, at most 10 percent of "
+        "zero replacement characters, zero C1 control characters, zero join "
+        "mismatches, at most 10 percent of "
         "targets dropped from the gaze arm, >95 percent of targets with 25+ responses",
         "without per-target type counts the multinomial likelihood is impossible; "
         "the project becomes the reading-time estimator alone with E4 as the paper",
     )
 
 
-def g1_throughput(tflops: float, threshold: float = 2.0, reference: str = "Qwen2.5-1.5B") -> GateResult:
+def g1_throughput(tflops: float, threshold: float = 2.5, reference: str = "Qwen2.5-1.5B") -> GateResult:
     """G1: sustained throughput of the packed forward decides the primary reference."""
     return GateResult(
         "G1", bool(tflops >= threshold),

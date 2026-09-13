@@ -35,7 +35,7 @@ from lcsa.projection import centre, whiten
 from lcsa.reliability import spearman_brown
 
 __all__ = ["participant_counts", "fit_participants", "summarise", "run_shard",
-           "assemble", "merge", "run"]
+           "assemble", "not_run", "merge", "run"]
 
 log = logging.getLogger(__name__)
 
@@ -212,6 +212,19 @@ def assemble(rows: list[dict], out_dir, external=None) -> dict:
     summary = summarise(rows, external)
     art.table("e5_summary", summary)
     res = {"summary": summary, "n_rows": len(rows)}
+    art.save("e5_summary", res)
+    return res
+
+
+def not_run(out_dir, reason: str) -> dict:
+    """The audit's artifact when the per-participant responses are unavailable.
+
+    The raw cloze export is not part of the distributed norms, so this leg can
+    have no input at all.  Writing the status is what keeps a missing file
+    distinguishable from an audit that ran and found no spread.
+    """
+    art = Artifacts(out_dir, "e5")
+    res = {"status": "not_run", "reason": str(reason), "summary": [], "n_rows": 0}
     art.save("e5_summary", res)
     return res
 

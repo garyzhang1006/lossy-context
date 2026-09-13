@@ -79,7 +79,12 @@ BUILD=$(jid --dependency=afterok:$PRE:$REG --gres="$LCSA_GPU_GRES" slurm/build.s
 echo "build      $BUILD  ($LCSA_GPU_GRES)"
 REFS=$(jid --dependency=afterok:$BUILD --gres="$LCSA_GPU_GRES" --array=0-$(( ${#BREFS[@]} - 1 )) slurm/build_refs.sbatch)
 echo "refs       $REFS  (${#BREFS[@]} checkpoints)"
-E1=$(jid --dependency=afterok:$BUILD slurm/e1.sbatch);                echo "e1         $E1"
+# The all-subsets cache sits between the build and E1: it is a second GPU pass
+# over the short-context targets, and E1's bridging report is unscoreable
+# without it, so E1 waits on it rather than on the build.
+SUB=$(jid --dependency=afterok:$BUILD --gres="$LCSA_GPU_GRES" slurm/sub_cache.sbatch)
+echo "sub-cache  $SUB  ($LCSA_GPU_GRES)"
+E1=$(jid --dependency=afterok:$SUB slurm/e1.sbatch);                  echo "e1         $E1"
 REL=$(jid --dependency=afterok:$BUILD slurm/reliability.sbatch);      echo "reliability $REL"
 LAD=$(jid --dependency=afterok:$REFS slurm/e2_ladder.sbatch);         echo "e2 ladder  $LAD"
 COV=$(jid --dependency=afterok:$LAD --array=0-$((E2_SHARDS - 1)) slurm/e2_cov.sbatch)

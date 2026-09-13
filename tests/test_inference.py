@@ -172,6 +172,22 @@ def test_tost_refuses_to_speak_on_too_few_usable_replicates():
     assert not r.equivalent and r.n_used == 1
 
 
+def test_the_cluster_t_reference_never_declares_equivalence_more_readily():
+    """Prediction 6 wants equivalence, so the reference must not lean that way.
+
+    The 55-passage design gives 54 degrees of freedom, and a normal reference on
+    that many clusters returns the smaller of the two one-sided p-values, which
+    is the direction that flatters the registered prediction.
+    """
+    d = np.random.default_rng(6).normal(0.10, 0.09, 200)
+    normal_ref = tost(d, margin=0.25)
+    cluster_ref = tost(d, margin=0.25, df=54)
+    assert cluster_ref.p >= normal_ref.p
+    assert cluster_ref.df == 54 and normal_ref.df == float("inf")
+    with pytest.raises(ValueError, match="df must be positive"):
+        tost(d, margin=0.25, df=0)
+
+
 def test_rejection_rate_interval_brackets_the_rate():
     rate, lo, hi = rejection_rate([0.01] * 3 + [0.9] * 7)
     assert rate == pytest.approx(0.3)
