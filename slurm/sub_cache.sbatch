@@ -27,6 +27,11 @@ for f in "$B/cache.npz" "$B/targets.csv" "$B/candidates.json"; do
     [ -f "$f" ] || { echo "no $f; run slurm/build.sbatch first" >&2; exit 1; }
 done
 require_prefetched "$LCSA_MODEL"
+# As in build.sbatch: a requeued or preempted task must not repeat the 2^K
+# enumeration it already paid for.  The npz is the last file the leg writes.
+if [ -f "$B/sub_caches.npz" ]; then
+    echo "$B/sub_caches.npz exists, so the enumeration finished; remove it to redo the leg"; exit 0
+fi
 python -c 'import torch; assert torch.cuda.is_available(), "no CUDA device visible"'
 
 # Written into the build directory, not the artifacts one, because it is keyed

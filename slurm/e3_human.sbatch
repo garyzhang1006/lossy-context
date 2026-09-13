@@ -18,8 +18,19 @@ ENV="${LCSA_REPO:-$SLURM_SUBMIT_DIR}/slurm/env.sh"
 [ -f "$ENV" ] || { echo "submit from the repository root or export LCSA_REPO" >&2; exit 2; }
 . "$ENV"
 CACHE="$LCSA_ROOT/build/cache.npz"; OUT="$LCSA_ART"
+# The uncapped arm of prediction 13 is a second GPU build and this array
+# depends on it with afterany, so the flag goes in only when the cache is
+# there.  A build that failed then costs prediction 13 its number and leaves
+# the human fit and the whole contrast bootstrap standing.
+UNC=()
+if [ -f "$LCSA_ROOT/build_uncapped/cache.npz" ]; then
+    UNC=(--uncapped-cache "$LCSA_ROOT/build_uncapped/cache.npz")
+elif [ "$SLURM_ARRAY_TASK_ID" -eq 0 ]; then
+    echo "note: no $LCSA_ROOT/build_uncapped/cache.npz, so prediction 13 will be unscored"
+fi
 if [ "$SLURM_ARRAY_TASK_ID" -eq 0 ]; then
-    lcsa e3 --kernel "$LCSA_KERNEL" --cache "$CACHE" --out "$OUT" --stage human
+    lcsa e3 --kernel "$LCSA_KERNEL" --cache "$CACHE" --out "$OUT" --stage human \
+        ${UNC[@]+"${UNC[@]}"}
 else
     # As above: the count is the registered variable, so requeueing one task
     # alone still computes that task's own range.  Task 0 ran the stage above.

@@ -55,12 +55,33 @@ esac
 echo "install"
 if [ -f "$LCSA_VENV/bin/activate" ]; then ok "venv at $LCSA_VENV"
 else bad "no venv; sbatch slurm/setup.sbatch and wait for it"; fi
+# A setup job whose `pip install -e` failed still leaves bin/activate behind,
+# and every job in the chain then dies on `lcsa: command not found`.  Testing
+# for the entry point needs no interpreter, which matters because the login
+# nodes carry Python 3.6.8 and cannot import the package.
+if [ -x "$LCSA_VENV/bin/lcsa" ]; then ok "the lcsa entry point is installed"
+elif [ -f "$LCSA_VENV/bin/activate" ]; then bad "the venv has no bin/lcsa; the pip install in slurm/setup.sbatch did not finish"; fi
 
 echo "corpus"
 for f in "$LCSA_PROVO/Provo_Corpus-Predictability_Norms.csv" \
          "$LCSA_PROVO/Provo_Corpus-Eyetracking_Data.csv" "$LCSA_SUBTLEX"; do
     [ -f "$f" ] && ok "$(basename "$f")" || bad "missing $f"
 done
+# The three lines above say the files exist and nothing about what is in them,
+# which is how a tokenisation disagreement between the two Provo releases got
+# as far as a GPU allocation before G0 failed on it.  Reading them needs the
+# package, so the check is a job: slurm/checkdata.sbatch runs it on scu-cpu in
+# seconds and slurm/pipeline.sh makes the build wait on it.
+if [ -f "$LCSA_ROOT/build/checkdata/checkdata.json" ]; then
+    if grep -q '"submission_can_proceed": true' "$LCSA_ROOT/build/checkdata/checkdata.json"; then
+        ok "the corpus passed the data gate in an earlier run of slurm/checkdata.sbatch"
+    else
+        bad "the corpus failed the data gate; read $LCSA_ROOT/build/checkdata/checkdata.txt"
+    fi
+else
+    note "corpus contents unchecked here; slurm/checkdata.sbatch is the first job of the chain"
+    note "to see the answer before submitting: srun --partition=scu-cpu --time=00:20:00 --mem=8000M --pty bash slurm/checkdata.sbatch"
+fi
 
 echo "checkpoints"
 if [ -f "$HF_HOME/lcsa_prefetch.done" ]; then
@@ -101,11 +122,18 @@ NREFS=$(set -- $LCSA_REFS; echo $#)
 NSWEEP=$(set -- $LCSA_SWEEP_REFS; echo $#)
 HAVE_PART=0
 if [ -n "${LCSA_PARTICIPANTS:-}" ] && [ -f "$LCSA_PARTICIPANTS" ]; then HAVE_PART=1; fi
+# The fifteen are the jobs of a full submission that are not arrays and that
+# still count against the same limit: prefetch, check-data, register, build,
+# the uncapped build, the prefix probe, sub-cache, e1, reliability, the e2
+# ladder, e3 prepare, e3 self, confounds, the e4 sweep and the merge.
+# Counting only the array tasks understated a full chain by fifteen and
+# reported it as fitting when it did not.
+SINGLETONS=15
 TASKS=$(( E2_SHARDS + NREADERS * E3_SHARDS + E3_BOOT_SHARDS + 1 + E4_SHARDS + E6_SHARDS
-          + NREFS + NSWEEP + HAVE_PART * (E5_SHARDS + 1) ))
+          + NREFS + NSWEEP + HAVE_PART * (E5_SHARDS + 1) + SINGLETONS ))
 [ "$TASKS" -le "$LCSA_MAX_RUNNING" ] \
-    && ok "$TASKS array tasks, under the $LCSA_MAX_RUNNING the QOS runs at once" \
-    || note "$TASKS array tasks; QOS normal runs $LCSA_MAX_RUNNING at a time and queues the rest"
+    && ok "$TASKS jobs and array tasks, under the $LCSA_MAX_RUNNING the QOS runs at once" \
+    || note "$TASKS jobs and array tasks; QOS normal runs $LCSA_MAX_RUNNING at a time and queues the rest"
 RUNNING=$(squeue -h -u "$USER" -t RUNNING 2>/dev/null | wc -l | tr -d ' ')
 [ "${RUNNING:-0}" -eq 0 ] && ok "no jobs of yours are running" \
     || note "$RUNNING of your jobs are already running and count against the same $LCSA_MAX_RUNNING"

@@ -20,4 +20,12 @@ CACHE="$LCSA_ROOT/build/cache.npz"
 [ -f "$CACHE" ] || { echo "no cache at $CACHE; run slurm/build.sbatch first" >&2; exit 1; }
 SUB="$LCSA_ROOT/build/sub_caches.npz"
 [ -f "$SUB" ] || { echo "no subset caches at $SUB; run slurm/sub_cache.sbatch first" >&2; exit 1; }
-lcsa e1 --kernel "$LCSA_KERNEL" --cache "$CACHE" --out "$LCSA_ART" --sub-caches "$SUB"
+# The probe of prediction 12 is a separate GPU job and this one depends on it
+# with afterany, so the flag goes in only when the file is there.  A probe that
+# failed then costs prediction 12 its number and costs the other twelve
+# nothing, which is the trade the reference sweep already makes at the merge.
+PROBE=()
+if [ -f "$LCSA_ART/prefix_probe.json" ]; then PROBE=(--prefix-probe "$LCSA_ART/prefix_probe.json")
+else echo "note: no $LCSA_ART/prefix_probe.json, so prediction 12 will be unscored"; fi
+lcsa e1 --kernel "$LCSA_KERNEL" --cache "$CACHE" --out "$LCSA_ART" --sub-caches "$SUB" \
+    ${PROBE[@]+"${PROBE[@]}"}

@@ -172,20 +172,23 @@ def run(provo, keys, candidate_sets, scorer, out_dir, k_max: int = K_MAX,
     selects the registered positions fails here instead of reaching the paper.
     Leaving it ``None`` enumerates whatever the cap admits.
     """
-    caches = subset_caches(provo, keys, candidate_sets, scorer, k_max=k_max,
-                           max_depth=max_depth)
-    if not caches:
+    # Counting the selection is arithmetic on the passage lists, while
+    # enumerating it is sum(2^K) forward passes, so the count comes first and a
+    # drifted corpus costs seconds instead of the whole GPU leg.
+    rows = selected_targets(provo, keys, k_max=k_max, max_depth=max_depth)
+    if not rows:
         raise ValueError(
             f"no target of the {len(keys)} in targets.csv has K <= {int(k_max)}, so there "
             "is nothing to enumerate; raise --k-max, at 2^K forwards per target"
         )
-    rows = selected_targets(provo, keys, k_max=k_max, max_depth=max_depth)
     if expect_n is not None and len(rows) != int(expect_n):
         raise ValueError(
             f"the cap at K <= {int(k_max)} selects {len(rows)} of the {len(keys)} targets, "
             f"but the registration froze {int(expect_n)}; the corpus, the depth cap or the "
             "target list has changed, so re-freeze the registration before enumerating"
         )
+    caches = subset_caches(provo, keys, candidate_sets, scorer, k_max=k_max,
+                           max_depth=max_depth)
     art = Artifacts(out_dir, STEM)
     path = save_sub_caches(art.dir / f"{STEM}.npz", caches)
     rec = {

@@ -361,3 +361,58 @@ def test_the_norms_content_column_is_kept_when_it_is_present(tmp_path):
     provo = load_provo(_contraction_dir(tmp_path))
     flags = dict(zip(provo.words["word_number"], provo.words["is_content"]))
     assert [flags[i] for i in (2, 3, 4, 5, 6)] == [0.0, 1.0, 0.0, 1.0, 0.0]
+
+
+def test_a_windows_encoded_file_decodes_as_cp1252_not_as_control_characters(tmp_path):
+    """Excel writes the smart apostrophe at 0x92, which latin-1 reads as C1."""
+    norms = _norms_rows()
+    norms.loc[norms["Word"] == "story", "Word"] = "story’s"
+    norms.to_csv(tmp_path / "Provo_Corpus-Predictability_Norms.csv", index=False,
+                 encoding="cp1252")
+    raw, enc = read_provo_csv(tmp_path / "Provo_Corpus-Predictability_Norms.csv")
+    assert enc == "cp1252"
+    gate = g0_data_integrity(raw, load_provo(tmp_path, require_eye=False))
+    assert gate.measured["c1_control_chars"] == 0
+
+
+def test_a_curly_apostrophe_and_a_typed_one_are_the_same_word_type():
+    """Unfolded, the corpus spelling and the typed response split one count in two."""
+    assert canonical_word("doesn’t") == canonical_word("doesn't") == "doesn't"
+    assert canonical_word("“quoted”") == "quoted"
+    assert canonical_word("half—way") == "half-way"
+
+
+def test_a_content_column_that_says_the_same_thing_everywhere_takes_the_repair(tmp_path):
+    """A blank column read as all-function is worth exactly as much as no column."""
+    nrows, erows = [], []
+    for i, word in enumerate(_CONTRACTION_EYE, start=FIRST_WORD_NUMBER):
+        for resp, count in ((word.lower(), 20), ("thing", 20)):
+            nrows.append({"Text_ID": 3, "Word_Number": i, "Word": word,
+                          "Word_Content_Or_Function": "", "Response": resp,
+                          "Response_Count": count, "Total_Response_Count": 40})
+        for pid in range(4):
+            erows.append({"Text_ID": 3, "Word_Number": i, "Word": word,
+                          "Participant_ID": f"p{pid}",
+                          "Word_Content_Or_Function": _EYE_CONTENT[word],
+                          "IA_FIRST_RUN_DWELL_TIME": 200 + 10 * pid + 5 * i,
+                          "IA_LENGTH": len(word)})
+    pd.DataFrame(nrows).to_csv(
+        tmp_path / "Provo_Corpus-Predictability_Norms.csv", index=False)
+    pd.DataFrame(erows).to_csv(
+        tmp_path / "Provo_Corpus-Eyetracking_Data.csv", index=False)
+    provo = load_provo(tmp_path)
+    flags = dict(zip(provo.words["word_number"], provo.words["is_content"]))
+    assert [flags[i] for i in (2, 3, 4, 5)] == [0.0, 0.0, 1.0, 1.0]
+
+
+def test_an_empty_answer_does_not_become_a_vote_for_the_word_nan(tmp_path):
+    from lcsa.data.provo import load_cloze_participants
+
+    rows = [{"Participant_ID": "p1", "Text_ID": 1, "Word_Number": 2, "Response": "the"},
+            {"Participant_ID": "p1", "Text_ID": 1, "Word_Number": 3, "Response": ""},
+            {"Participant_ID": "", "Text_ID": 1, "Word_Number": 4, "Response": "story"}]
+    path = tmp_path / "cloze_by_participant.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    frame, _ = load_cloze_participants(path)
+    assert list(frame["response"]) == ["the"]
+    assert "nan" not in set(frame["response"]) | set(frame["participant"])

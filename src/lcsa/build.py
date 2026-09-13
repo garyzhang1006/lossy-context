@@ -34,8 +34,8 @@ from lcsa.tokenization import OOV, check_no_duplicates
 
 log = logging.getLogger(__name__)
 
-__all__ = ["BuildConfig", "candidate_set", "feature_matrix", "build_corpus",
-           "FEATURE_NAMES"]
+__all__ = ["BuildConfig", "candidate_set", "feature_matrix", "buildable_targets",
+           "build_corpus", "FEATURE_NAMES"]
 
 FEATURE_NAMES = ["log_unigram", "length", "is_content", "log_docfreq"]
 
@@ -146,6 +146,37 @@ def feature_matrix(
     return (F - F.mean(axis=0)) / sd
 
 
+def buildable_targets(provo: ProvoData, cfg: BuildConfig | None = None) -> list:
+    """Every target the build admits, decided before any model is loaded.
+
+    Returns ``(row, responses, word_number, n_context, K)`` per target, in the
+    order :func:`build_corpus` builds them.  It is the same filter, called from
+    the same place, so a login-node check can count the targets a submission
+    will produce and compare that count against the registered design without
+    holding a GPU for the answer.
+    """
+    cfg = cfg or BuildConfig()
+    grouped = {k: g for k, g in provo.responses.groupby(["text_id", "word_number"])}
+    out = []
+    for r in provo.words.itertuples():
+        grp = grouped.get((int(r.text_id), int(r.word_number)))
+        if grp is None or float(grp["count"].sum()) < cfg.min_responses:
+            continue
+        passage = provo.passages[int(r.text_id)]
+        # Passages are indexed by word_number, whose empty slots are the numbers
+        # Provo does not carry, so the depth counts the real words below the
+        # target rather than the index itself: three passages are missing a word
+        # in the middle, and every passage is missing its first.
+        ti = int(r.word_number)
+        if not (0 < ti < len(passage)) or not passage[ti]:
+            continue
+        n_context = sum(1 for x in passage[:ti] if x)
+        if n_context == 0:
+            continue
+        out.append((r, grp, ti, n_context, min(n_context, cfg.max_depth)))
+    return out
+
+
 def build_corpus(
     provo: ProvoData,
     scorer,
@@ -192,31 +223,13 @@ def build_corpus(
         log.warning("no target is marked as a content word, so the is_content "
                     "feature is constant and the repaired fit loses a dimension")
 
-    resp = provo.responses
-    grouped = {k: g for k, g in resp.groupby(["text_id", "word_number"])}
-
     P_list, n_list, u_list, f_list, g_list, clusters, wid, slots, nctx, tkeys = (
         [], [], [], [], [], [], [], [], [], []
     )
-    rows = provo.words.itertuples()
     n_done = 0
-    for r in rows:
+    for r, grp, ti, n_context, K in buildable_targets(provo, cfg):
         key = (int(r.text_id), int(r.word_number))
-        grp = grouped.get(key)
-        if grp is None or float(grp["count"].sum()) < cfg.min_responses:
-            continue
         passage = provo.passages[int(r.text_id)]
-        # Passages are indexed by word_number, whose empty slots are the numbers
-        # Provo does not carry, so the depth counts the real words below the
-        # target rather than the index itself: three passages are missing a word
-        # in the middle, and every passage is missing its first.
-        ti = int(r.word_number)
-        if not (0 < ti < len(passage)) or not passage[ti]:
-            continue
-        n_context = sum(1 for x in passage[:ti] if x)
-        if n_context == 0:
-            continue
-        K = min(n_context, cfg.max_depth)
         if select is not None and not select(int(r.text_id), int(r.word_number), K):
             continue
 
@@ -329,7 +342,8 @@ def provo_perplexity(provo: ProvoData, scorer) -> dict:
     }
 
 
-def gate_g0(corpus: Corpus, provo: ProvoData, sample: int = 25, seed: int = 0) -> dict:
+def gate_g0(corpus: Corpus, provo: ProvoData, sample: int | None = None,
+            seed: int = 0) -> dict:
     """G0: the cache is arithmetic on the right object.
 
     Checks that every cache row is a proper distribution, that no row is
@@ -338,8 +352,14 @@ def gate_g0(corpus: Corpus, provo: ProvoData, sample: int = 25, seed: int = 0) -
     than numerical noise.  A pass does not prove the tokenisation is right; a
     failure proves it is wrong, which is what a gate is for.
     """
-    rng = np.random.default_rng(seed)
-    idx = rng.choice(len(corpus), size=min(sample, len(corpus)), replace=False)
+    # The default reads every target.  A sample of 25 out of some 2,600 passes
+    # with probability well over 0.9 when a whole class of targets is degenerate,
+    # and the whole-corpus pass is one walk over a 40 MB buffer.
+    if sample is None:
+        idx = np.arange(len(corpus))
+    else:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(corpus), size=min(sample, len(corpus)), replace=False)
     bad_sum, degenerate, spans = 0, 0, []
     for t in idx:
         tg = corpus.target(int(t))

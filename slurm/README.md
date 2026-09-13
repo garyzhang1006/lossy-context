@@ -167,12 +167,25 @@ file with a different count instead of dropping the tail from the last shard.
    that one checkpoint, names it as missing in `refsweep.csv`, and every
    registered leg still merges.
 4. `bash slurm/preflight.sh` checks the partitions, the gres string, the
-   scratch paths, the venv, the three corpus files and the array width
-   against the running-job cap, and prints one line per check. It runs in a
-   few seconds on a login node and reports the failures that would otherwise
-   appear one job at a time over the following day.
+   scratch paths, the venv and its `bin/lcsa` entry point, the three corpus
+   files and the array width against the running-job cap, and prints one line
+   per check. It runs in a few seconds on a login node and reports the
+   failures that would otherwise appear one job at a time over the following
+   day. It says that the corpus files are present and nothing about what is
+   in them, because reading them needs the package and the login nodes carry
+   python 3.6.8, so the contents are the job in step 5 instead. Once that job
+   has run, preflight reads its verdict out of
+   `$LCSA_ROOT/build/checkdata/checkdata.json` and repeats it.
 5. `bash slurm/pipeline.sh` submits the chain below, starting with
-   `prefetch.sbatch` and `register.sbatch`, which every other job waits on.
+   `prefetch.sbatch`, `checkdata.sbatch` and `register.sbatch`, which every
+   other job waits on. `LCSA_UNCAPPED_DEPTH` sets the depth of the second arm
+   of prediction 13 and defaults to 128, which is a ceiling well above the
+   longest Provo passage rather than a target, so raising it costs nothing and
+   `lcsa e3 --stage human` refuses the arm if any target is still truncated. `checkdata.sbatch` is the data gate on a cpu node. It
+   runs the same G0 the build runs, counts the targets the build will admit,
+   and compares the short-context selection against the frozen registration,
+   which are the two failures that otherwise cancel the whole chain hours in
+   and after a card has been granted.
    The chain includes E6 and the reference sweep; E5 is submitted and
    registered only when `LCSA_PARTICIPANTS` points at the per-participant
    cloze export, because the distributed norms do not carry it.
@@ -181,16 +194,19 @@ file with a different count instead of dropping the tail from the last shard.
 | --- | --- | --- | --- | --- |
 | `setup.sbatch` | scu-cpu | 4 cpu, 16000M | 2 h | the venv from the compute nodes' python 3.9, the install, `lcsa selftest` |
 | `prefetch.sbatch` | scu-cpu | 2 cpu, 8000M | 6 h | every checkpoint downloaded sequentially into `HF_HOME`, then the corpus files checked; writes the offline marker |
+| `checkdata.sbatch` | scu-cpu | 2 cpu, 8000M | 20 min | `lcsa check-data`: G0 on the two Provo files, the admitted-target count, and the short-context selection against the registered 439; writes `build/checkdata/checkdata.json` |
 | `register.sbatch` | scu-cpu | 1 cpu, 2000M | 10 min | `lcsa register`: the frozen design, predictions and reading rule with their SHA-256 |
 | `build.sbatch` | scu-gpu | 1 L40S, 8 cpu, 48000M | 12 h | the memory preflight, a 20-target smoke build with a throughput extrapolation, then the full build at the registered settings |
+| `build_uncapped.sbatch` | scu-gpu | 1 L40S, 8 cpu, 48000M | 12 h | the same targets cached with the depth cap lifted to `LCSA_UNCAPPED_DEPTH`, which is the second arm prediction 13 compares against; about 67,000 context forward passes, so about what `build.sbatch` costs |
+| `prefix_probe.sbatch` | scu-gpu | 1 L40S, 8 cpu, 48000M | 2 h | fifty targets rescored from the passage start, which is the displacement prediction 12 reads out of `e1_summary`; minutes on a card |
 | `build_refs.sbatch` | scu-gpu | array of `LCSA_REFS`, 1 L40S, 8 cpu, 48000M | 12 h | GPT-2-large, GPT-2-small and Qwen2.5-0.5B caches on the primary's frozen candidate sets |
 | `sub_cache.sbatch` | scu-gpu | 1 L40S, 8 cpu, 48000M | 12 h | the all-subsets cache of the targets at `K <= K_MAX`: every retention mask, not only the suffixes, which is what the bridging report of prediction 10 is scored from |
-| `e1.sbatch` | scu-cpu | 4 cpu, 16000M | 12 h | exactness, sensitivity, residual fractions, and the bridging report over `sub_caches.npz` |
+| `e1.sbatch` | scu-cpu | 4 cpu, 16000M | 12 h | exactness, sensitivity, residual fractions, the bridging report over `sub_caches.npz`, and the probe summary when `prefix_probe.json` is there |
 | `e2_ladder.sbatch` | scu-cpu | 4 cpu, 16000M | 12 h | the ladder generated under GPT-2-large and fitted under Qwen, plus `e2_theta0.json` |
 | `e2_cov.sbatch` | scu-cpu | array of `E2_SHARDS`, 4 cpu, 16000M | 12 h | coverage replicates at rungs 4, 8, 12, 16, 20, 24 and 32; the ceiling is read from these |
 | `e3_prepare.sbatch` | scu-gpu | 1 L40S, 8 cpu, 48000M | 12 h | the constrained fit, the N0-PRIME calibration and the lexical, topic and order tilts |
 | `e3_reps.sbatch` | scu-cpu | array of readers x `E3_SHARDS`, 4 cpu, 16000M | 12 h | null replicates per reader |
-| `e3_human.sbatch` | scu-cpu | array 0-`E3_BOOT_SHARDS`, 4 cpu, 16000M | 12 h | task 0 the human fit, the rest the paired contrast bootstrap |
+| `e3_human.sbatch` | scu-cpu | array 0-`E3_BOOT_SHARDS`, 4 cpu, 16000M | 12 h | task 0 the human fit, and the uncapped fit beside it when `build_uncapped/cache.npz` is there, the rest the paired contrast bootstrap |
 | `e3_self.sbatch` | scu-cpu | 4 cpu, 16000M | 24 h | the plain floor under the GPT-2-small cache |
 | `reliability.sbatch` | scu-cpu | 2 cpu, 8000M | 4 h | G3: debiased split-half JS and participant-half gaze reliability |
 | `e5_participants.sbatch` | scu-cpu | array of `E5_SHARDS`+1, 4 cpu, 16000M | 12 h | per-participant half-lives pinned to the pooled nuisances, split-half reliability, alignments; needs `LCSA_PARTICIPANTS` |
@@ -202,10 +218,16 @@ file with a different count instead of dropping the tail from the last shard.
 | `merge.sbatch` | scu-cpu | 2 cpu, 8000M | 1 h | `lcsa register --check`, `lcsa merge` with the scorecard, `refsweep.csv` collected from the sweep tasks, the gate summary, the manifest |
 
 Every job depends on its inputs with `afterok`, so a failed stage leaves its
-dependants pending and `scancel` clears them. The one exception is
-`refsweep.sbatch`, which `merge.sbatch` joins with `afterany`, because the
-sweep feeds one appendix table and a checkpoint that ran out of memory or was
-never fetched should drop out of that table rather than cancel the merge. `build.sbatch` and
+dependants pending and `scancel` clears them. Three jobs are joined with
+`afterany` instead, because each one feeds a single number that the merge
+reports as missing rather than a leg the rest of the chain is built on.
+`merge.sbatch` joins `refsweep.sbatch` that way, since the sweep feeds one
+appendix table and a checkpoint that ran out of memory or was never fetched
+should drop out of that table rather than cancel the merge. `e1.sbatch` joins
+`prefix_probe.sbatch` and `e3_human.sbatch` joins `build_uncapped.sbatch` for
+the same reason, and both read their extra input only when the file is there,
+so a failed probe or a failed uncapped build costs prediction 12 or 13 its
+number and costs the other eleven nothing. `build.sbatch` and
 `build_refs.sbatch` skip a build whose `g0_cache.json`, the last file a build
 writes, exists, so resubmitting after a partial run costs only the smoke pass
 and a build that died between the cache and its gate is redone. A build whose

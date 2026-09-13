@@ -98,8 +98,10 @@ export LCSA_MAX_RUNNING="${LCSA_MAX_RUNNING:-250}"
 # Reference checkpoints for E4 and the ladder generator, built on the primary's
 # frozen candidate sets by build_refs.sbatch; slugs replace "/" with "_".
 export LCSA_REFS="${LCSA_REFS:-gpt2-large gpt2 Qwen/Qwen2.5-0.5B}"
-# The reference sweep of the appendix: four families, 410M to 8B parameters,
-# each fitted on the frozen candidate sets; gpt2-large is shared with LCSA_REFS.
+# The reference sweep of the appendix, which is four checkpoints from three
+# families and runs from 410M to 8B parameters, each one fitted on the frozen
+# candidate sets.  The sweep shares no checkpoint with LCSA_REFS above, so a
+# reader who wants the gpt2 family in the sweep table reads it from E4.
 export LCSA_SWEEP_REFS="${LCSA_SWEEP_REFS:-EleutherAI/pythia-410m EleutherAI/pythia-1.4b Qwen/Qwen2.5-7B meta-llama/Llama-3.1-8B}"
 # E5 and E6 shard counts; E5 needs LCSA_PARTICIPANTS, the per-participant cloze file.
 export E5_SHARDS="${E5_SHARDS:-10}"; export E6_SHARDS="${E6_SHARDS:-20}"

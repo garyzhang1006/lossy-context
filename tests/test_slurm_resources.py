@@ -122,3 +122,34 @@ def test_the_gres_the_submit_script_passes_matches_the_files():
         m = re.search(rf'{var}:-([^}}]+)}}', env)
         assert m, f"{var} has no default in env.sh"
         assert re.fullmatch(r"gpu(:[a-z0-9]+)?:[1-9]\d*", m.group(1)), m.group(1)
+
+
+PIPELINE = (SLURM / "pipeline.sh").read_text()
+# The installer is run by hand before anything else and is the one script the
+# chain does not submit; every other file here is a job or it is dead.
+NOT_SUBMITTED = {"setup.sbatch"}
+
+
+@pytest.mark.parametrize("path", SBATCH, ids=lambda p: p.name)
+def test_the_chain_submits_every_job_this_directory_holds(path):
+    """A job nothing submits is a registered prediction nobody scores.
+
+    Predictions 12 and 13 were unscoreable for exactly this reason: the flags
+    that carry them existed on the command line and no sbatch passed them.
+    """
+    if path.name in NOT_SUBMITTED:
+        return
+    submitted = [ln for ln in PIPELINE.splitlines()
+                 if "jid " in ln and path.name in ln]
+    assert submitted, f"{path.name} is never passed to jid in slurm/pipeline.sh"
+
+
+def test_the_two_optional_inputs_are_read_only_where_a_job_writes_them():
+    """Both are joined with afterany, so both readers must tolerate absence."""
+    e1 = (SLURM / "e1.sbatch").read_text()
+    human = (SLURM / "e3_human.sbatch").read_text()
+    assert "--prefix-probe" in e1 and "prefix_probe.json" in e1
+    assert "--uncapped-cache" in human and "build_uncapped/cache.npz" in human
+    # afterok on either would let one unscored prediction cancel a whole leg.
+    assert "afterany:$PROBE" in PIPELINE
+    assert "afterany:$UNC" in PIPELINE

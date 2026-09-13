@@ -33,7 +33,11 @@ read -ra REFS <<< "$LCSA_SWEEP_REFS"
     exit 2; }
 MODEL="${REFS[$SLURM_ARRAY_TASK_ID]}"
 OUT=$(ref_dir "$MODEL")
-if [ ! -f "$OUT/cache.npz" ]; then
+# Keyed on the gate record and not on cache.npz, for the reason build.sbatch
+# gives: cache.npz is written before targets.csv, candidates.json and
+# perplexity.json, so a task preempted between them would otherwise skip the
+# rebuild and run the fit against a directory missing half its artifacts.
+if [ ! -f "$OUT/g0_cache.json" ]; then
     # A soft skip and not require_prefetched: these are the appendix checkpoints,
     # and prefetch.sbatch is allowed to leave a gated one out of the marker.  A
     # failed task here would cancel merge through its afterok dependency, so the

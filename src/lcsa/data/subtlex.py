@@ -12,11 +12,14 @@ would make ``u`` an improper mixture component and send the score to infinity.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+log = logging.getLogger(__name__)
 
 __all__ = ["Unigrams", "load_subtlex"]
 
@@ -61,7 +64,17 @@ def load_subtlex(path: str | Path | None, min_count: float = 1.0) -> Unigrams:
             "https://www.ugent.be/pp/experimentele-psychologie/en/research/documents/subtlexus"
         )
     if p.suffix.lower() in {".xlsx", ".xls"}:
-        df = pd.read_excel(p)
+        # keep_default_na for the same reason the csv branch passes it: the
+        # words "null", "none", "NA" and "N/A" are entries in this table, and
+        # pandas would otherwise read all four as missing and floor them.
+        try:
+            df = pd.read_excel(p, keep_default_na=False, na_values=[""])
+        except ImportError as exc:
+            raise ImportError(
+                f"reading {p} needs the openpyxl package, which the pinned "
+                "environment does not install; either `pip install openpyxl` into "
+                "the venv or save the sheet as csv and point --subtlex at that"
+            ) from exc
     else:
         sep = "\t" if p.suffix.lower() in {".tsv", ".txt"} else ","
         df = pd.read_csv(p, sep=sep, encoding="latin-1", keep_default_na=False,
@@ -75,7 +88,20 @@ def load_subtlex(path: str | Path | None, min_count: float = 1.0) -> Unigrams:
         )
     words = df[wcol].astype(str).str.strip().str.lower()
     freq = pd.to_numeric(df[fcol], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
-    freq = np.clip(freq, 0.0, None) + min_count
+    freq = np.clip(freq, 0.0, None)
+    # SUBTLEX-US keys its rows on the written form, so "will" and "Will" are two
+    # rows that lowercase to one key.  Building the dict straight from the pairs
+    # keeps whichever row comes last, and the file is sorted by frequency, so the
+    # common word would inherit the count of the rare proper noun.  The counts of
+    # the case variants are the count of the lowercase type, so they add.
+    dup = int(words.duplicated().sum())
+    if dup:
+        agg = pd.Series(freq, index=words.to_numpy()).groupby(level=0, sort=False).sum()
+        log.info("%s: %d rows share a lowercase word with another row; their "
+                 "counts were added", p, dup)
+        words = pd.Series(agg.index.astype(str))
+        freq = agg.to_numpy(dtype=np.float64)
+    freq = freq + min_count
     total = float(freq.sum())
     logp = dict(zip(words, np.log(freq / total)))
     floor = float(np.log(min_count / total))

@@ -72,6 +72,50 @@ def _ensure_out(out) -> Path:
     return d
 
 
+def cmd_check_data(args) -> int:
+    """Everything ``lcsa build`` checks about the corpus, without the GPU.
+
+    The build runs G0 after Slurm has granted a card, so a corpus the loader
+    cannot reconcile costs an allocation before it says why.  This reads the
+    same files, runs the same gate, counts the targets the build will admit and
+    compares the short-context selection against the frozen design, which is
+    the other failure that cancels the chain.  It needs a compute node only
+    because the login nodes carry Python 3.6.
+    """
+    from lcsa.checkdata import BRIDGING_TARGETS, check_data, report
+
+    # The registered count is the default because the chain that reads this
+    # corpus is the registered one, and `none` exists for a reader who has
+    # changed the design on purpose and wants the rest of the check anyway.
+    raw = args.expect_bridging
+    if raw is None:
+        expect = BRIDGING_TARGETS
+    elif str(raw).strip().lower() in ("none", "off"):
+        expect = None
+    else:
+        expect = int(raw)
+    gate, warn, extra = check_data(
+        args.provo_dir, subtlex=args.subtlex, norms_name=args.norms_name,
+        require_eye=not args.no_eye, expect_bridging=expect,
+    )
+    text = report(gate, warn, extra)
+    print(text)
+    # A bridging mismatch is not a G0 failure, and it still stops the run,
+    # because the sub-cache leg raises on it and every job below is afterok.
+    blocked = (not gate.passed) or ("bridging" in warn) or (args.strict and bool(warn))
+    if args.out:
+        out = _ensure_out(args.out)
+        # slurm/preflight.sh greps submission_can_proceed out of this file,
+        # which is why the verdict is written as one key rather than left for a
+        # shell script to recompute from the gate row and the warning list.
+        (out / "checkdata.json").write_text(json.dumps(
+            {"submission_can_proceed": not blocked,
+             "gate": gate.as_row(), "warnings": warn, "counts": extra},
+            indent=2, default=str))
+        (out / "checkdata.txt").write_text(text + "\n")
+    return 1 if blocked else 0
+
+
 def cmd_build(args) -> int:
     from lcsa.build import BuildConfig, build_corpus, gate_g0, provo_perplexity
     from lcsa.cache import ReferenceScorer
@@ -1107,6 +1151,20 @@ def build_parser() -> argparse.ArgumentParser:
     mg.add_argument("--n-participants", type=int, default=None,
                     help="participant count the E5 shards must tile (N_PART on the cluster)")
     mg.set_defaults(func=cmd_merge)
+
+    cd = sub.add_parser("check-data", help="run the data gate on CPU, before any GPU job")
+    cd.add_argument("--provo-dir", required=True)
+    cd.add_argument("--norms-name", default="Provo_Corpus-Predictability_Norms.csv")
+    cd.add_argument("--subtlex", default=None)
+    cd.add_argument("--out", default=None, help="write checkdata.json and checkdata.txt here")
+    cd.add_argument("--no-eye", action="store_true", help="skip the eye-tracking arm")
+    cd.add_argument("--expect-bridging", default=None,
+                    help="how many targets the short-context selection must produce; "
+                         "the registered count by default, and `none` to skip the "
+                         "comparison on a corpus the registration does not cover")
+    cd.add_argument("--strict", action="store_true",
+                    help="exit nonzero on any warning, not only on the two that stop the run")
+    cd.set_defaults(func=cmd_check_data)
 
     st = sub.add_parser("selftest", help="synthetic end-to-end run, no data, no GPU")
     st.add_argument("--out", default="artifacts/selftest")

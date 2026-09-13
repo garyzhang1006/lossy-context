@@ -36,7 +36,12 @@ log = logging.getLogger(__name__)
 __all__ = ["ProvoData", "load_provo", "read_provo_csv", "canonical_word",
            "load_cloze_participants"]
 
-_ENCODINGS = ("utf-8", "latin-1", "cp1252")
+#: Tried in order, and the loop below advances only on a decode error.  cp1252
+#: comes before latin-1 because latin-1 maps every byte to a code point and so
+#: never raises, which would make the cp1252 rung unreachable and would turn a
+#: corpus exported through Excel, where the smart apostrophe lives at 0x92, into
+#: a file of C1 control characters that G0 fails on.
+_ENCODINGS = ("utf-8", "cp1252", "latin-1")
 
 _NORM_ALIASES = {
     "text_id": ["text_id", "textid"],
@@ -79,9 +84,25 @@ _EYE_ALIASES = {
 }
 
 
+#: Typographic punctuation the Provo files carry and cloze typists do not.
+_PUNCT_FOLD = str.maketrans({
+    "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'",
+    "\u201c": '"', "\u201d": '"', "\u201e": '"',
+    "\u2012": "-", "\u2013": "-", "\u2014": "-", "\u2015": "-",
+    "\u2026": "...", "\u00a0": " ",
+})
+
+
 def canonical_word(w: str) -> str:
-    """Lowercase and strip surrounding punctuation, keeping internal apostrophes."""
-    s = str(w).strip().lower()
+    """Lowercase and strip surrounding punctuation, keeping internal apostrophes.
+
+    Curly quotes and dashes fold to their ASCII spelling first, because the
+    corpus carries the curly form and the cloze responses carry the typed one.
+    Left unfolded, one word type occupies two rows of the same candidate
+    simplex, which splits its response count, misses the unigram table and
+    points the target slot at whichever spelling the corpus used.
+    """
+    s = str(w).translate(_PUNCT_FOLD).strip().lower()
     return s.strip(".,;:!?\"'()[]{}<>*")
 
 
@@ -293,10 +314,16 @@ def load_provo(
         }
     )
     if "word_content_or_function" in cols:
-        n["is_content"] = (
-            norms[cols["word_content_or_function"]].astype(str).str.lower().str[:7]
-            == "content"
-        ).astype(float)
+        # A cell that says neither word becomes NaN rather than 0.0, because a
+        # blank column read as "every target is a function word" is a constant
+        # feature the fit cannot use and no gate looks at, and because the
+        # recovery from the eye-tracking arm below keys on the missing value.
+        flag = (norms[cols["word_content_or_function"]]
+                .fillna("").astype(str).str.strip().str.lower())
+        n["is_content"] = np.where(
+            flag.str[:7] == "content", 1.0,
+            np.where(flag.str[:8] == "function", 0.0, np.nan),
+        )
     else:
         log.warning("%s has no Word_Content_Or_Function column; the is_content "
                     "feature is missing for every target", norms_name)
@@ -454,22 +481,28 @@ def load_provo(
                 keys = [k for k, ok in zip(keys, keep) if ok]
             if shifted:
                 gaze = gaze.assign(word_number=[remap.get(k, k[1]) for k in keys])
-            # The 2018 norms release does not always carry the content/function
-            # column the eye-tracking release does, and without it every target
-            # reads as a function word, which silently zeroes one of the four
-            # lexical features the repaired estimator fits.
-            if "content" in gaze.columns:
-                if w["is_content"].isna().all() and gaze["content"].notna().any():
-                    flag = (gaze.dropna(subset=["content"])
-                            .groupby(["text_id", "word_number"])["content"].first())
-                    w = w.assign(is_content=[
-                        flag.get((int(t), int(k)), np.nan)
-                        for t, k in zip(w["text_id"], w["word_number"])
-                    ])
-                    log.info("is_content was recovered for %d of %d targets from %s",
-                             int(w["is_content"].notna().sum()), len(w), eye_name)
-                gaze = gaze.drop(columns=["content"])
             gaze = gaze.drop(columns=["word"])
+        # The 2018 norms release does not always carry the content/function
+        # column the eye-tracking release does, and without it every target
+        # reads as a function word, which silently zeroes one of the four
+        # lexical features the repaired estimator fits.  A column that is
+        # present and says the same thing for every target is worth exactly as
+        # much as an absent one, so both take the repair.  This sits outside
+        # the alignment block above because an eye file can carry the flag
+        # without carrying the word column the walk needs.
+        if "content" in gaze.columns:
+            uninformative = (w["is_content"].isna().all()
+                             or w["is_content"].nunique(dropna=True) <= 1)
+            if uninformative and gaze["content"].notna().any():
+                flag = (gaze.dropna(subset=["content"])
+                        .groupby(["text_id", "word_number"])["content"].first())
+                w = w.assign(is_content=[
+                    flag.get((int(t), int(k)), np.nan)
+                    for t, k in zip(w["text_id"], w["word_number"])
+                ])
+                log.info("is_content was recovered for %d of %d targets from %s",
+                         int(w["is_content"].notna().sum()), len(w), eye_name)
+            gaze = gaze.drop(columns=["content"])
     elif require_eye:
         raise FileNotFoundError(f"{eye_path} not found and require_eye=True")
 
@@ -514,14 +547,17 @@ def load_cloze_participants(path: str | Path) -> tuple[pd.DataFrame, str]:
                     {"participant", "text_id", "word_number", "response"},
                     "participant cloze file")
     out = pd.DataFrame({
-        "participant": df[cols["participant"]].astype(str).str.strip(),
+        "participant": df[cols["participant"]].fillna("").astype(str).str.strip(),
         "text_id": pd.to_numeric(df[cols["text_id"]], errors="coerce"),
         "word_number": pd.to_numeric(df[cols["word_number"]], errors="coerce"),
-        "response": df[cols["response"]].astype(str).str.strip(),
+        "response": df[cols["response"]].fillna("").astype(str).str.strip(),
     })
     n0 = len(out)
     out = out.dropna(subset=["text_id", "word_number"])
-    out = out[out["response"] != ""]
+    # Without the fillna above, an empty cell reaches astype(str) as NaN and
+    # becomes the four-character string "nan", which survives this filter as a
+    # vote for a word nobody typed and as a participant nobody is.
+    out = out[(out["response"] != "") & (out["participant"] != "")]
     out["text_id"] = out["text_id"].astype(int)
     out["word_number"] = out["word_number"].astype(int)
     dup = out.duplicated(["participant", "text_id", "word_number"]).sum()

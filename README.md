@@ -56,6 +56,20 @@ This builds a 120-target synthetic corpus in memory, runs all four experiments o
 it, and prints `SELFTEST PASSED`. It needs no data, no GPU and no network, and it
 finishes in about a minute. If it fails, nothing downstream is worth starting.
 
+Once the corpus is in place, the data gate runs on its own and without a GPU,
+which is worth doing before any submission because the build runs the same gate
+only after Slurm has granted a card.
+
+```bash
+lcsa check-data --provo-dir data/provo --subtlex data/SUBTLEXusfrequencyabove1.csv
+```
+
+It reads the two Provo files, runs G0, counts the targets the build will admit
+and checks that the short-context selection still matches the registered 439,
+and it exits non-zero when the submission would die. On the cluster the same
+check is `slurm/checkdata.sbatch`, which `slurm/pipeline.sh` puts at the head of
+the chain.
+
 The test suite is the stronger check and takes a couple of minutes:
 
 ```bash
@@ -223,10 +237,11 @@ smoke run at 20 replicates is a reasonable first pass.
 
 ## Slurm
 
-`slurm/` holds job scripts for the SCU cluster: the GPU build and the three
-reference builds on `scu-gpu`, the E3 prepare stage on a GPU, and every
-replicate loop as a `scu-cpu` array of shards, chained with `afterok` by
-`slurm/pipeline.sh` and combined by `merge.sbatch`. At the default shard
+`slurm/` holds job scripts for the SCU cluster: the data gate and the frozen
+registration on `scu-cpu`, the GPU build and the three reference builds on
+`scu-gpu`, the E3 prepare stage on a GPU, and every replicate loop as a
+`scu-cpu` array of shards, chained with `afterok` by `slurm/pipeline.sh` and
+combined by `merge.sbatch`. At the default shard
 counts the registered run finishes in about half a day of wall clock after the
 builds. `slurm/README.md` explains the partition and QoS constraints the
 scripts encode and the order to run them in.

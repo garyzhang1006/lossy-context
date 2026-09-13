@@ -49,10 +49,14 @@ EOF
 # the excess rather than refusing it, so this is a note about wall clock and
 # not an error; it is printed here because an array that sits in PENDING with
 # reason QOSMaxJobsPerUserLimit otherwise looks like a stuck chain.
+# The fifteen singleton jobs are named in slurm/preflight.sh, and they count
+# against the same limit as the array tasks do.  The name rather than the
+# number, because test_cluster_paths compares the two formulas as text.
+SINGLETONS=15
 TASKS=$(( E2_SHARDS + ${#READERS[@]} * E3_SHARDS + E3_BOOT_SHARDS + 1 + E4_SHARDS + E6_SHARDS
-          + ${#BREFS[@]} + ${#SWEEPREFS[@]} + HAVE_PART * (E5_SHARDS + 1) ))
+          + ${#BREFS[@]} + ${#SWEEPREFS[@]} + HAVE_PART * (E5_SHARDS + 1) + SINGLETONS ))
 [ "$TASKS" -le "$LCSA_MAX_RUNNING" ] || echo \
-    "note: this chain submits $TASKS array tasks and QOS normal runs $LCSA_MAX_RUNNING at a time, so the rest wait with reason QOSMaxJobsPerUserLimit"
+    "note: this chain submits $TASKS jobs and QOS normal runs $LCSA_MAX_RUNNING at a time, so the rest wait with reason QOSMaxJobsPerUserLimit"
 
 if [ "${1:-}" = robustness ]; then
     [ "$LCSA_KERNEL" != power ] || { echo "robustness needs LCSA_KERNEL=linear" >&2; exit 2; }
@@ -72,11 +76,23 @@ fi
 # and the frozen registration.  Both are cheap to repeat and neither touches a
 # result, so they run at the head of every submission.
 PRE=$(jid slurm/prefetch.sbatch);                                    echo "prefetch   $PRE"
+# The data gate, on a cpu node, before anything asks for a card.  It reads the
+# corpus that build.sbatch would read hours later and refuses a submission
+# whose files do not reconcile or whose short-context selection disagrees with
+# the frozen registration.  It is cheap and it holds no GPU, so it runs at the
+# head of every submission.
+CHK=$(jid slurm/checkdata.sbatch);                                    echo "check-data $CHK"
 REGLEGS=e1,e2,e3,e4,e6
 [ "$HAVE_PART" -eq 0 ] || REGLEGS=$REGLEGS,e5
 REG=$(REGISTER_LEGS=$REGLEGS jid slurm/register.sbatch);              echo "register   $REG  (legs $REGLEGS)"
-BUILD=$(jid --dependency=afterok:$PRE:$REG --gres="$LCSA_GPU_GRES" slurm/build.sbatch)
+BUILD=$(jid --dependency=afterok:$PRE:$REG:$CHK --gres="$LCSA_GPU_GRES" slurm/build.sbatch)
 echo "build      $BUILD  ($LCSA_GPU_GRES)"
+# The second arm of prediction 13, which is the same targets cached with the
+# depth cap lifted.  It waits on what the build waits on rather than on the
+# build, so the two cards run side by side and the human fit is not held for a
+# second pass over the corpus.  Nothing downstream depends on it with afterok.
+UNC=$(jid --dependency=afterok:$PRE:$REG:$CHK --gres="$LCSA_GPU_GRES" slurm/build_uncapped.sbatch)
+echo "uncapped   $UNC  ($LCSA_GPU_GRES)"
 REFS=$(jid --dependency=afterok:$BUILD --gres="$LCSA_GPU_GRES" --array=0-$(( ${#BREFS[@]} - 1 )) slurm/build_refs.sbatch)
 echo "refs       $REFS  (${#BREFS[@]} checkpoints)"
 # The all-subsets cache sits between the build and E1: it is a second GPU pass
@@ -84,7 +100,13 @@ echo "refs       $REFS  (${#BREFS[@]} checkpoints)"
 # without it, so E1 waits on it rather than on the build.
 SUB=$(jid --dependency=afterok:$BUILD --gres="$LCSA_GPU_GRES" slurm/sub_cache.sbatch)
 echo "sub-cache  $SUB  ($LCSA_GPU_GRES)"
-E1=$(jid --dependency=afterok:$SUB slurm/e1.sbatch);                  echo "e1         $E1"
+# The probe of prediction 12, which is fifty targets rescored from the passage
+# start and the only job that writes prefix_probe.json.
+PROBE=$(jid --dependency=afterok:$BUILD --gres="$LCSA_GPU_GRES" slurm/prefix_probe.sbatch)
+echo "prefix     $PROBE  ($LCSA_GPU_GRES)"
+# E1 waits on the probe with afterany and reads the file only if it is there,
+# so a failed probe costs prediction 12 its number and the other twelve none.
+E1=$(jid --dependency=afterok:$SUB,afterany:$PROBE slurm/e1.sbatch); echo "e1         $E1"
 REL=$(jid --dependency=afterok:$BUILD slurm/reliability.sbatch);      echo "reliability $REL"
 LAD=$(jid --dependency=afterok:$REFS slurm/e2_ladder.sbatch);         echo "e2 ladder  $LAD"
 COV=$(jid --dependency=afterok:$LAD --array=0-$((E2_SHARDS - 1)) slurm/e2_cov.sbatch)
@@ -93,7 +115,8 @@ PREP=$(jid --dependency=afterok:$BUILD --gres="$LCSA_GPU_GRES" slurm/e3_prepare.
 echo "e3 prepare $PREP"
 REPS=$(jid --dependency=afterok:$PREP --array=0-$(( ${#READERS[@]} * E3_SHARDS - 1 )) slurm/e3_reps.sbatch)
 echo "e3 reps    $REPS"
-HUM=$(jid --dependency=afterok:$PREP --array=0-$E3_BOOT_SHARDS slurm/e3_human.sbatch)
+# afterany on the uncapped build, for the reason E1 waits on the probe that way.
+HUM=$(jid --dependency=afterok:$PREP,afterany:$UNC --array=0-$E3_BOOT_SHARDS slurm/e3_human.sbatch)
 echo "e3 human   $HUM"
 SELF=$(jid --dependency=afterok:$REFS slurm/e3_self.sbatch);          echo "e3 self    $SELF"
 CONF=$(jid --dependency=afterok:$REFS slurm/confounds.sbatch);       echo "confounds  $CONF"
